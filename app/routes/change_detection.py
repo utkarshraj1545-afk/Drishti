@@ -44,37 +44,46 @@ def analyze_change(request: ChangeDetectionRequest):
         )
 
         # Calculate before-period NDVI
-        before_ndvi, before_scenes = get_ndvi_for_period(
-            aoi,
-            request.before_start,
-            request.before_end,
-        )
+        before_result = get_ndvi_for_period(
+         aoi,
+         request.before_start,
+         request.before_end,
+       )
+
+        before_ndvi = before_result["mean_ndvi"]
+        before_scenes = before_result["scene_count"]
+
 
         # Calculate after-period NDVI
-        after_ndvi, after_scenes = get_ndvi_for_period(
-            aoi,
-            request.after_start,
-            request.after_end,
-        )
+        after_result = get_ndvi_for_period(
+         aoi,
+         request.after_start,
+         request.after_end,
+         )
+
+        after_ndvi = after_result["mean_ndvi"]
+        after_scenes = after_result["scene_count"]
 
         # Calculate percentage change
-        change_percent, classification = compute_change(
-            before_ndvi,
-            after_ndvi,
-        )
+        # Calculate percentage change
+        change_result = compute_change(
+             before_ndvi,
+             after_ndvi,
+         )
 
         return {
-            "before": {
-                "mean_ndvi": before_ndvi,
-                "scenes": before_scenes,
-            },
-            "after": {
+             "before": {
+                 "mean_ndvi": before_ndvi,
+                 "scenes": before_scenes,
+             },
+             "after": {
                 "mean_ndvi": after_ndvi,
                 "scenes": after_scenes,
             },
-            "change_percent": change_percent,
-            "classification": classification,
-        }
+             "change_percent": change_result["pct_change"],
+             "classification": change_result["direction"],
+             "note": change_result["note"],
+         }
 
     except ValueError as e:
         raise HTTPException(
