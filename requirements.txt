@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pydantic
+earthengine-api
+google-api-python-client
+httpx
