@@ -1,4 +1,12 @@
-## Interactive Vision-Language Assistant for Remote Sensing Analysis
+# SatQuery AI
+### SIH26167 – Interactive Vision-Language Assistant for Remote Sensing Analysis
+
+**Team:** Team Respawn 
+**Theme:** Space Technology  
+**Category:** Software  
+**Smart India Hackathon 2026**
+
+---
 
 ## Problem Statement
 
