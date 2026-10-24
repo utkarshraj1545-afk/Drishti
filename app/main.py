@@ -14,11 +14,15 @@ app = FastAPI(
 allowed_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
+    "https://prakriti-blue.vercel.app",
 ]
 
 vercel_url = os.getenv("FRONTEND_URL")
 if vercel_url:
-    allowed_origins.append(vercel_url.rstrip("/"))
+    vercel_url = vercel_url.rstrip("/")
+    if vercel_url not in allowed_origins:
+        allowed_origins.append(vercel_url)
+
 
 app.add_middleware(
     CORSMiddleware,
