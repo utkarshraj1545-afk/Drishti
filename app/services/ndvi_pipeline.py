@@ -1,52 +1,112 @@
-"""
-NDVI Pipeline for SatQuery AI
-==============================
-Core deterministic remote-sensing module. Every function here produces a
-number or image derived directly from satellite band math -- nothing here
-is estimated by an AI model. This is the "ground truth" layer that the
-VLM will later explain in plain language.
 
-Maps to the 8-step pipeline:
-  1. resolve_aoi          - turn a bbox into an ee.Geometry
-  2. get_cloud_filtered_collection - fetch valid scenes for a date range
-  3. build_composite       - median-composite the collection into one image
-  4. compute_ndvi_image    - band math: (NIR - Red) / (NIR + Red)
-  5. get_mean_ndvi         - reduce the NDVI image to a single number
-  6/7. get_ndvi_for_period - steps 2-5 combined for one date window
-  8. compute_change        - compare two periods, get % vegetation change
 """
+NDVI Pipeline for DRISHTI
+=========================
+
+Deterministic Sentinel-2 vegetation analysis using Google Earth Engine.
+
+Features:
+- Sentinel-2 Surface Reflectance Harmonized imagery
+- Per-pixel SCL cloud, shadow, cirrus, and snow masking
+- Median image compositing
+- NDVI calculation using Sentinel-2 B8 and B4
+- Mean NDVI and valid-pixel coverage statistics
+- Low-coverage warnings and empty-data validation
+- Percentage change and vegetation-change classification
+"""
+
+import math
 import ee
 
 
+# Initial coverage warning threshold.
+# This is a configurable project threshold, not a universal scientific standard.
+COVERAGE_WARNING_THRESHOLD = 70.0
+
+
+# ---------------------------------------------------------------------------
+# Initialization
+# ---------------------------------------------------------------------------
+
 def init_earth_engine(service_account_email: str, key_path: str):
     """
-    Call once at backend startup. Authenticates using the service account
-    JSON key (never the personal browser login -- that only works for
-    the Code Editor, not a server process).
+    Authenticate and initialize Google Earth Engine using a service account.
     """
-    credentials = ee.ServiceAccountCredentials(service_account_email, key_path)
+    credentials = ee.ServiceAccountCredentials(
+        service_account_email,
+        key_path,
+    )
     ee.Initialize(credentials)
 
 
 # ---------------------------------------------------------------------------
-# Step 1: Resolve AOI
+# Step 1: Resolve area of interest
 # ---------------------------------------------------------------------------
-def resolve_aoi(west: float, south: float, east: float, north: float) -> ee.Geometry:
-    """
-    Converts a bounding box into an ee.Geometry.Rectangle.
 
-    Coordinates are in standard lon/lat order (NOT lat/lon -- this trips
-    people up constantly). West/east are longitude, south/north are latitude.
-
-    Example: Delhi region
-        resolve_aoi(west=76.8, south=28.4, east=77.4, north=28.9)
+def resolve_aoi(
+    west: float,
+    south: float,
+    east: float,
+    north: float,
+) -> ee.Geometry:
     """
+    Convert a longitude/latitude bounding box into an Earth Engine rectangle.
+    """
+    if not all(
+        math.isfinite(value)
+        for value in (west, south, east, north)
+    ):
+        raise ValueError("AOI coordinates must be finite numbers.")
+
+    if not (-180 <= west <= 180 and -180 <= east <= 180):
+        raise ValueError("Longitude must be between -180 and 180.")
+
+    if not (-90 <= south <= 90 and -90 <= north <= 90):
+        raise ValueError("Latitude must be between -90 and 90.")
+
+    if west >= east:
+        raise ValueError("West longitude must be less than east longitude.")
+
+    if south >= north:
+        raise ValueError("South latitude must be less than north latitude.")
+
     return ee.Geometry.Rectangle([west, south, east, north])
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Cloud-filtered collection
+# Step 2: Sentinel-2 cloud and invalid-pixel masking
 # ---------------------------------------------------------------------------
+
+def mask_sentinel2_clouds(image: ee.Image) -> ee.Image:
+    """
+    Mask invalid and cloud-contaminated Sentinel-2 pixels using SCL.
+
+    Excluded SCL classes:
+        0  = No data
+        1  = Saturated or defective pixels
+        3  = Cloud shadows
+        8  = Clouds, medium probability
+        9  = Clouds, high probability
+        10 = Cirrus
+        11 = Snow or ice
+
+    The mask is applied to every image before compositing.
+    """
+    scl = image.select("SCL")
+
+    valid_pixels = (
+        scl.neq(0)
+        .And(scl.neq(1))
+        .And(scl.neq(3))
+        .And(scl.neq(8))
+        .And(scl.neq(9))
+        .And(scl.neq(10))
+        .And(scl.neq(11))
+    )
+
+    return image.updateMask(valid_pixels)
+
+
 def get_cloud_filtered_collection(
     aoi: ee.Geometry,
     start_date: str,
@@ -54,39 +114,43 @@ def get_cloud_filtered_collection(
     max_cloud_pct: int = 20,
 ) -> ee.ImageCollection:
     """
-    Returns every Sentinel-2 scene covering the AOI within the date range,
-    filtered to only scenes where cloud cover is below max_cloud_pct.
+    Fetch Sentinel-2 SR Harmonized scenes for an AOI and date range.
 
-    We fetch a COLLECTION, not a single image, because any one satellite
-    pass over an AOI is likely to have some cloud cover. This is what lets
-    step 3 (compositing) smooth that out.
+    First filters scenes by their overall cloud percentage, then applies
+    the per-pixel SCL mask.
 
-    dates as 'YYYY-MM-DD' strings.
+    Note: scene-level cloud percentage does not represent the cloud
+    percentage inside the selected AOI.
     """
+    if not 0 <= max_cloud_pct <= 100:
+        raise ValueError("max_cloud_pct must be between 0 and 100.")
+
+    if start_date >= end_date:
+        raise ValueError("Start date must be earlier than end date.")
+
     collection = (
         ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
         .filterBounds(aoi)
         .filterDate(start_date, end_date)
-        .filter(ee.Filter.lt("CLOUDY_PIXEL_PERCENTAGE", max_cloud_pct))
+        .filter(
+            ee.Filter.lt(
+                "CLOUDY_PIXEL_PERCENTAGE",
+                max_cloud_pct,
+            )
+        )
+        .map(mask_sentinel2_clouds)
     )
+
     return collection
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Build composite
+# Step 3: Build median composite
 # ---------------------------------------------------------------------------
+
 def build_composite(collection: ee.ImageCollection) -> ee.Image:
     """
-    Merges a collection of images into ONE image using a per-pixel median.
-
-    Why median, not average? If a handful of images in the collection still
-    have leftover cloud/shadow (our cloud filter isn't perfect), those pixels
-    become extreme outliers. Median is far less sensitive to outliers than
-    mean -- it picks the "middle" value per pixel across the whole stack,
-    so a few bad frames get outvoted rather than skewing the result.
-
-    Returns a single ee.Image with all the original bands (B1-B12 etc.)
-    still available -- we haven't touched NDVI yet, that's step 4.
+    Build a per-pixel median composite from the masked image collection.
     """
     return collection.median()
 
@@ -94,72 +158,155 @@ def build_composite(collection: ee.ImageCollection) -> ee.Image:
 # ---------------------------------------------------------------------------
 # Step 4: Compute NDVI
 # ---------------------------------------------------------------------------
+
 def compute_ndvi_image(composite: ee.Image) -> ee.Image:
     """
-    NDVI = (NIR - Red) / (NIR + Red)
+    Calculate NDVI using Sentinel-2 bands:
 
-    For Sentinel-2:
-        B8 = Near-Infrared (NIR)
-        B4 = Red
+        NDVI = (B8 - B4) / (B8 + B4)
 
-    Why this formula works (the physics, not just math):
-    Chlorophyll in healthy leaves strongly ABSORBS red light (for
-    photosynthesis) but the leaf's internal cell structure strongly
-    REFLECTS near-infrared light. So healthy vegetation = high NIR,
-    low Red -> NDVI close to +1.
+    B8 = Near-infrared
+    B4 = Red
 
-    Bare soil, roads, and buildings reflect Red and NIR fairly similarly
-    -> NDVI close to 0.
-
-    Water absorbs NIR strongly -> NDVI is negative.
-
-    normalizedDifference() is Earth Engine's built-in helper -- you give
-    it [band1, band2] and it computes (band1 - band2) / (band1 + band2)
-    for every pixel. We rename the output band to "NDVI" so later
-    functions can refer to it by name.
+    Earth Engine normalizedDifference() masks pixels where either input
+    band is negative. Such pixels will therefore not count as valid NDVI
+    pixels in the coverage calculation.
     """
-    ndvi = composite.normalizedDifference(["B8", "B4"]).rename("NDVI")
-    return ndvi
+    return composite.normalizedDifference(
+        ["B8", "B4"]
+    ).rename("NDVI")
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Reduce to a single number
+# Step 5: Calculate mean NDVI
 # ---------------------------------------------------------------------------
-def get_mean_ndvi(ndvi_image: ee.Image, aoi: ee.Geometry, scale: int = 10) -> float:
+
+def get_mean_ndvi(
+    ndvi_image: ee.Image,
+    aoi: ee.Geometry,
+    scale: int = 10,
+) -> float:
     """
-    compute_ndvi_image() gives you an NDVI value PER PIXEL across the AOI --
-    still an image, not a number. This function averages all those pixel
-    values into one headline statistic: "the mean NDVI across this region."
+    Calculate the mean NDVI over the AOI using valid pixels only.
 
-    reduceRegion() is Earth Engine's tool for collapsing an image down to
-    statistics over an area. We use Reducer.mean() to get the average.
-
-    `scale=10` matters: it tells Earth Engine what pixel resolution to
-    sample at, in meters. Sentinel-2's B4/B8 bands are natively 10m
-    resolution -- using scale=10 means we sample at native resolution.
-    Using a coarser scale (e.g. 100) would average over bigger blocks and
-    give a less precise (though faster to compute) result.
-
-    maxPixels is set high because reduceRegion refuses to run over very
-    large areas by default, as a safety limit against runaway compute cost.
-
-    .getInfo() is what actually pulls the result from Earth Engine's
-    servers back into a normal Python value -- everything before this
-    point is just "instructions," not yet executed. Earth Engine is lazy:
-    it doesn't compute anything until you explicitly ask for the result.
+    Raises ValueError if the AOI contains no usable NDVI pixels.
     """
     stats = ndvi_image.reduceRegion(
         reducer=ee.Reducer.mean(),
         geometry=aoi,
         scale=scale,
         maxPixels=1e9,
+        tileScale=4,
+    ).getInfo()
+
+    mean_ndvi = stats.get("NDVI")
+
+    if mean_ndvi is None:
+        raise ValueError(
+            "No valid NDVI pixels remain for this AOI and date range. "
+            "Try different dates or review the cloud mask."
+        )
+
+    mean_ndvi = float(mean_ndvi)
+
+    if not math.isfinite(mean_ndvi):
+        raise ValueError("The calculated mean NDVI is not finite.")
+
+    return mean_ndvi
+
+
+# ---------------------------------------------------------------------------
+# Step 6: Calculate valid-pixel coverage
+# ---------------------------------------------------------------------------
+
+
+def get_valid_pixel_coverage(
+    ndvi_image: ee.Image,
+    aoi: ee.Geometry,
+    scale: int = 10,
+) -> dict:
+    """
+    Calculate valid NDVI pixel coverage over the entire AOI.
+
+    Both counts use the same fixed projection and sampling scale:
+    - total_pixel_count: all grid pixels sampled inside the AOI
+    - valid_pixel_count: sampled pixels with valid NDVI after masking
+
+    Coverage = valid pixels / total sampled pixels * 100.
+    """
+    if scale <= 0:
+        raise ValueError("scale must be greater than zero.")
+
+    # Use the NDVI image's native projection as the common grid.
+    projection = ndvi_image.projection()
+
+    # A constant image clipped to the AOI counts the full sampled area.
+    total_image = (
+        ee.Image.constant(1)
+        .rename("total")
+        .setDefaultProjection(projection)
+        .clip(aoi)
     )
-    return stats.get("NDVI").getInfo()
+
+    # Convert the NDVI mask into explicit 1 (valid) and 0 (invalid)
+    # values, then fill masked locations with zero.
+    valid_image = (
+        ndvi_image.mask()
+        .gt(0)
+        .unmask(0, False)
+        .rename("valid")
+        .setDefaultProjection(projection)
+        .clip(aoi)
+    )
+
+    # Keep the two bands separate so each is summed using its own values.
+    counts = (
+        total_image
+        .addBands(valid_image)
+        .reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi,
+            scale=scale,
+            crs=projection,
+            maxPixels=1e9,
+            tileScale=4,
+        )
+        .getInfo()
+    )
+
+    total_value = counts.get("total")
+    valid_value = counts.get("valid")
+
+    if total_value is None or valid_value is None:
+        raise ValueError(
+            "Could not calculate pixel coverage for this AOI. "
+            "Check the coordinates and satellite imagery."
+        )
+
+    total = int(total_value)
+    valid = int(valid_value)
+
+    if total <= 0:
+        raise ValueError(
+            "No sampled pixels were found inside the AOI."
+        )
+
+    valid = min(max(valid, 0), total)
+    coverage_percent = valid / total * 100.0
+
+    return {
+        "valid_pixel_count": valid,
+        "total_pixel_count": total,
+        "coverage_percent": round(coverage_percent, 2),
+    }
+
+
 
 
 # ---------------------------------------------------------------------------
-# Steps 2-5 combined: everything needed for ONE date window
+# Steps 2-7: Analyze one date period
 # ---------------------------------------------------------------------------
+
 def get_ndvi_for_period(
     aoi: ee.Geometry,
     start_date: str,
@@ -167,79 +314,131 @@ def get_ndvi_for_period(
     max_cloud_pct: int = 20,
 ) -> dict:
     """
-    Runs the full pipeline (Functions 3, 4, 5, 6) for a single date window
-    and returns everything you need for that period in one call:
-      - the mean NDVI value
-      - the composite image itself (so a thumbnail can be generated later)
-      - how many scenes went into the composite (useful for transparency --
-        "this result is based on N cloud-free scenes")
+    Analyze one date period and return NDVI, scene count, and coverage.
 
-    Raises ValueError if no usable imagery was found, rather than silently
-    returning a broken/empty result. This is the honest-failure-handling
-    we talked about -- better to tell the user "widen your date range"
-    than to hand back a meaningless number.
+    Returns:
+        mean_ndvi
+        composite_image
+        scene_count
+        valid_pixel_count
+        total_pixel_count
+        coverage_percent
+        coverage_warning
+
+    Raises ValueError if no scenes or no usable NDVI pixels are available.
     """
-    collection = get_cloud_filtered_collection(aoi, start_date, end_date, max_cloud_pct)
+    collection = get_cloud_filtered_collection(
+        aoi,
+        start_date,
+        end_date,
+        max_cloud_pct,
+    )
 
     scene_count = collection.size().getInfo()
+
     if scene_count == 0:
         raise ValueError(
-            f"No cloud-free Sentinel-2 imagery found for this AOI between "
-            f"{start_date} and {end_date} (cloud threshold: {max_cloud_pct}%). "
-            f"Try widening the date range or raising max_cloud_pct."
+            f"No Sentinel-2 scenes met the cloud filter for this AOI "
+            f"between {start_date} and {end_date}. "
+            f"The scene cloud threshold is {max_cloud_pct}%. "
+            "Try a wider date range or a higher cloud threshold."
         )
 
     composite = build_composite(collection)
     ndvi_image = compute_ndvi_image(composite)
+
+    # Check coverage before reporting the mean NDVI.
+    coverage = get_valid_pixel_coverage(ndvi_image, aoi)
+
+    if coverage["valid_pixel_count"] == 0:
+        raise ValueError(
+            f"No valid NDVI pixels remain for {start_date} to {end_date}. "
+            "Cloud masking may have removed all usable pixels. "
+            "Try a different date range or review the AOI."
+        )
+
     mean_ndvi = get_mean_ndvi(ndvi_image, aoi)
+
+    coverage_warning = None
+
+    if coverage["coverage_percent"] < COVERAGE_WARNING_THRESHOLD:
+        coverage_warning = (
+            f"Low valid-pixel coverage: "
+            f"{coverage['coverage_percent']:.2f}% of sampled AOI pixels "
+            f"were usable. Interpret this period's NDVI cautiously."
+        )
+
+        print(
+            f"WARNING: {coverage_warning} "
+            f"Period: {start_date} to {end_date}"
+        )
 
     return {
         "mean_ndvi": mean_ndvi,
         "composite_image": composite,
         "scene_count": scene_count,
+        "valid_pixel_count": coverage["valid_pixel_count"],
+        "total_pixel_count": coverage["total_pixel_count"],
+        "coverage_percent": coverage["coverage_percent"],
+        "coverage_warning": coverage_warning,
     }
 
 
 # ---------------------------------------------------------------------------
 # Step 8: Compute change between two periods
 # ---------------------------------------------------------------------------
-def compute_change(before_ndvi: float, after_ndvi: float) -> dict:
+
+def compute_change(
+    before_ndvi: float,
+    after_ndvi: float,
+) -> dict:
     """
-    Takes two mean NDVI values (from two calls to get_ndvi_for_period)
-    and computes the percentage change between them.
+    Compare mean NDVI between two periods.
 
-    % change = (after - before) / before * 100
+    Percentage change:
+        ((after_ndvi - before_ndvi) / before_ndvi) * 100
 
-    Negative result = vegetation LOSS (NDVI dropped -- e.g. deforestation)
-    Positive result = vegetation GAIN (e.g. regrowth, new crop cycle)
+    A negative change means NDVI decreased.
+    A positive change means NDVI increased.
 
-    We guard against before_ndvi == 0 (or very close to it) because
-    dividing by a near-zero baseline produces a meaningless, wildly
-    exaggerated percentage -- an honest edge case to handle rather than
-    silently returning garbage like "38000% change."
+    The percentage is rounded to one decimal place before classification,
+    ensuring the displayed percentage and classification use the same value.
+
+    Note:
+        NDVI change alone does not prove flooding, vegetation damage,
+        or whether an area is safe.
     """
+    if not math.isfinite(before_ndvi) or not math.isfinite(after_ndvi):
+        raise ValueError("NDVI values must be finite numbers.")
+
     if abs(before_ndvi) < 1e-6:
         return {
             "pct_change": None,
             "direction": "undetermined",
             "note": (
-                "Baseline NDVI is too close to zero (likely bare ground, "
-                "water, or urban area) -- percentage change isn't a "
-                "meaningful metric here. Report absolute NDVI values instead."
+                "Baseline NDVI is too close to zero. Percentage change "
+                "may not be meaningful for this area. Review the absolute "
+                "NDVI values and land cover."
             ),
         }
 
-    pct_change = ((after_ndvi - before_ndvi) / before_ndvi) * 100
+    pct_change = ((after_ndvi - before_ndvi) / before_ndvi) * 100.0
+    rounded_change = round(pct_change, 1)
 
-    if pct_change < -5:
+    if rounded_change < -5.0:
         direction = "vegetation loss"
-    elif pct_change > 5:
+    elif rounded_change > 5.0:
         direction = "vegetation gain"
     else:
         direction = "no significant change"
 
     return {
-        "pct_change": round(pct_change, 1),
+        "pct_change": rounded_change,
         "direction": direction,
-        "note": None,
+        "note": (
+            "NDVI change indicates a change in vegetation greenness. "
+            "It does not independently confirm flooding, vegetation "
+            "damage, or whether an area is safe. Cloud cover, seasonal "
+            "changes, and image availability can affect the results."
+        ),
     }
