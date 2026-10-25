@@ -1,7 +1,9 @@
+
 from io import BytesIO
 from datetime import date
 import os
 from pathlib import Path
+from html import escape
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
@@ -17,7 +19,6 @@ from app.services.ndvi_pipeline import (
 
 router = APIRouter()
 
-# Earth Engine credentials must remain private and outside shared ZIP files.
 SERVICE_ACCOUNT = os.getenv(
     "EARTH_ENGINE_SERVICE_ACCOUNT",
     "satquery-backend@satquery-ai-507509.iam.gserviceaccount.com",
@@ -49,10 +50,233 @@ class ChangeDetectionRequest(BaseModel):
     max_cloud_pct: int = Field(default=80, ge=1, le=100)
 
 
+def is_hindi(request: ChangeDetectionRequest) -> bool:
+    """Check whether the request asks for a Hindi report."""
+    language = str(request.language).strip().lower().replace("_", "-")
+    return language in {"hi", "hindi"} or language.startswith("hi-")
+def is_hindi_labels(labels: dict) -> bool:
+    """Detect Hindi labels from the translated report text."""
+    return any(
+        any("\u0900" <= char <= "\u097f" for char in str(value))
+        for value in labels.values()
+    )
+
+
+def report_labels(request: ChangeDetectionRequest) -> dict:
+    """Return report labels in the selected language."""
+
+    if is_hindi(request):
+        return {
+            "title": "PRAKRITI — NDVI परिवर्तन विश्लेषण",
+            "subtitle": "उपग्रह आधारित वनस्पति तुलना रिपोर्ट",
+            "aoi": "अध्ययन क्षेत्र",
+            "coordinate": "निर्देशांक",
+            "value": "मान",
+            "west": "पश्चिमी देशांतर",
+            "south": "दक्षिणी अक्षांश",
+            "east": "पूर्वी देशांतर",
+            "north": "उत्तरी अक्षांश",
+            "periods": "तुलना की अवधि",
+            "metric": "मापदंड",
+            "before": "पहले की अवधि",
+            "after": "बाद की अवधि",
+            "date_range": "तिथि सीमा",
+            "date_to": "से",
+            "mean_ndvi": "औसत NDVI",
+            "scenes": "उपग्रह चित्रों की संख्या",
+            "valid_pixels": "उपयोग योग्य पिक्सेल",
+            "total_pixels": "कुल नमूना पिक्सेल",
+            "coverage": "उपयोग योग्य पिक्सेल का प्रतिशत",
+            "warnings": "डेटा कवरेज संबंधी चेतावनी",
+            "coverage_explanation": (
+                 "यह प्रतिशत बताता है कि अध्ययन क्षेत्र के कितने "
+                 "पिक्सेल में उपयोग योग्य NDVI डेटा उपलब्ध था। "
+                 "अधिक कवरेज से पूरे क्षेत्र का आकलन बेहतर होता है।"
+             ),
+            "results": "विश्लेषण के परिणाम",
+            "change": "NDVI में परिवर्तन",
+            "classification": "वर्गीकरण",
+            "not_available": "उपलब्ध नहीं",
+            "decreased": "NDVI में कमी",
+            "increased": "NDVI में वृद्धि",
+            "no_change": "NDVI में कोई सापेक्ष परिवर्तन नहीं",
+            "could_not_calculate": "NDVI परिवर्तन की गणना नहीं हो सकी",
+            "interpretation": "व्याख्या",
+            "provisional": "इस तुलना को प्रारंभिक मानें।",
+            "caution": (
+                "मौसम, बादल और उपग्रह चित्रों की उपलब्धता परिणामों "
+                "को प्रभावित कर सकती है। NDVI में बदलाव वनस्पति की "
+                "हरियाली में बदलाव का संकेत देता है, लेकिन इससे "
+                "अकेले वनस्पति क्षति या किसी क्षेत्र की सुरक्षा "
+                "की पुष्टि नहीं की जा सकती।"
+            ),
+            "before_warning": "पहले की अवधि",
+            "after_warning": "बाद की अवधि",
+            "provisional_classification": "प्रारंभिक परिणाम",
+            "low_coverage": "कम उपयोग योग्य पिक्सेल कवरेज",
+            "ndvi_decreased_by": "NDVI में कमी",
+            "ndvi_increased_by": "NDVI में वृद्धि",
+            "coverage_sentence_low": "हालाँकि, बाद की अवधि में केवल",
+            "coverage_sentence_low_end": (
+                "नमूना पिक्सेल उपयोग योग्य थे, जो निर्धारित सीमा से कम है।"
+            ),
+            "coverage_sentence_ok": (
+                "बाद की अवधि में उपयोग योग्य पिक्सेल कवरेज"
+            ),
+            "coverage_unavailable": (
+                "बाद की अवधि का कवरेज उपलब्ध नहीं था।"
+            ),
+            "threshold": "निर्धारित सीमा",
+        }
+
+    return {
+        "title": "PRAKRITI — NDVI Change Analysis",
+        "subtitle": "Satellite-based vegetation comparison report",
+        "aoi": "Area of Interest",
+        "coordinate": "Coordinate",
+        "value": "Value",
+        "west": "West longitude",
+        "south": "South latitude",
+        "east": "East longitude",
+        "north": "North latitude",
+        "periods": "Comparison Periods",
+        "metric": "Metric",
+        "before": "Before period",
+        "after": "After period",
+        "date_range": "Date range",
+        "date_to": "to",
+        "mean_ndvi": "Mean NDVI",
+        "scenes": "Satellite scenes",
+        "valid_pixels": "Valid pixels",
+        "total_pixels": "Total sampled pixels",
+        "coverage": "Valid-pixel coverage",
+        "warnings": "Valid-Pixel Coverage Warnings",
+        "coverage_explanation": (
+            "Coverage is the percentage of sampled AOI pixels with usable "
+            "NDVI after masking. Coverage alone does not guarantee imagery "
+            "quality."
+        ),
+        "results": "Analysis Results",
+        "change": "NDVI change",
+        "classification": "Classification",
+        "not_available": "Not available",
+        "decreased": "NDVI decreased",
+        "increased": "NDVI increased",
+        "no_change": "NDVI showed no relative change",
+        "could_not_calculate": "NDVI change could not be calculated",
+        "interpretation": "Interpretation",
+        "provisional": "Treat this comparison as provisional.",
+        "caution": (
+            "Seasonal variation, cloud masking, and image availability may "
+            "affect the result. NDVI change alone does not confirm vegetation "
+            "damage or flooding."
+        ),
+        "before_warning": "Before period",
+        "after_warning": "After period",
+        "provisional_classification": "Provisional result",
+        "low_coverage": "low valid-pixel coverage",
+        "ndvi_decreased_by": "NDVI decreased by",
+        "ndvi_increased_by": "NDVI increased by",
+        "coverage_sentence_low": "However, only",
+        "coverage_sentence_low_end": (
+            "of sampled pixels were usable in the after period, "
+            "below the threshold."
+        ),
+        "coverage_sentence_ok": (
+            "Valid-pixel coverage in the after period was"
+        ),
+        "coverage_unavailable": "After-period coverage was not available.",
+        "threshold": "Threshold",
+    }
+
+
+
+
+def translate_classification(value, labels: dict):
+    """Translate known classification values using the selected language."""
+
+    hindi = is_hindi_labels(labels)
+
+    if value is None:
+        return labels["not_available"]
+
+    # Preserve the original classification in English mode.
+    if not hindi:
+        return str(value)
+
+    normalized = str(value).strip().lower().replace("_", " ").replace("-", " ")
+
+    if normalized in {
+        "vegetation gain",
+        "vegetation increased",
+        "vegetation increase",
+        "increase",
+        "increased",
+        "gain",
+    }:
+        return labels["increased"]
+
+    if normalized in {
+        "vegetation loss",
+        "vegetation decreased",
+        "vegetation decrease",
+        "decrease",
+        "decreased",
+        "loss",
+    }:
+        return labels["decreased"]
+
+    if normalized in {
+        "no significant change",
+        "no change",
+        "unchanged",
+    }:
+        return labels["no_change"]
+
+    # Preserve unexpected classifications rather than mislabeling them.
+    return str(value)
+
+
+
+def translate_coverage_warning(value, request, period_label):
+    """Translate known coverage-warning text while preserving unknown details."""
+
+    if not value:
+        return None
+
+    if not is_hindi(request):
+        return f"{period_label}: {value}"
+
+    text = str(value).strip()
+    normalized = text.lower()
+
+    # Common coverage warnings used by the NDVI pipeline.
+    if "coverage" in normalized and (
+        "low" in normalized or "below" in normalized
+    ):
+        return (
+            f"{period_label}: उपयोग योग्य पिक्सेल कवरेज कम है। "
+            "इस अवधि के परिणाम को सावधानी से देखें।"
+        )
+
+    if "no usable" in normalized or "no valid" in normalized:
+        return (
+            f"{period_label}: उपयोग योग्य NDVI डेटा उपलब्ध नहीं था।"
+        )
+
+    # Preserve the source message if its exact meaning is unknown.
+    return f"{period_label}: {text}"
+
+
 def run_analysis(request: ChangeDetectionRequest) -> dict:
     """Run the shared analysis used by both API endpoints."""
 
-    # Validate bounding-box coordinates.
+    print(
+        f"DRISHTI DEBUG: language={request.language!r}, "
+        f"hindi={is_hindi(request)}, "
+        f"file={Path(__file__).resolve()}"
+    )
+
     if request.west >= request.east:
         raise ValueError(
             "West longitude must be less than east longitude."
@@ -73,7 +297,6 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
             "The supplied coordinates are outside valid ranges."
         )
 
-    # Validate ISO date strings.
     date_fields = {
         "before_start": request.before_start,
         "before_end": request.before_end,
@@ -101,7 +324,6 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
             "After-period start date must not follow its end date."
         )
 
-    # Initialize Google Earth Engine using the configured credentials.
     key_path = Path(SERVICE_ACCOUNT_KEY).expanduser()
 
     if not key_path.is_file():
@@ -113,7 +335,6 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
 
     init_earth_engine(SERVICE_ACCOUNT, str(key_path))
 
-    # Resolve the selected area of interest.
     aoi = resolve_aoi(
         request.west,
         request.south,
@@ -121,7 +342,6 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
         request.north,
     )
 
-    # Analyze the before period.
     before_result = get_ndvi_for_period(
         aoi,
         request.before_start,
@@ -129,7 +349,6 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
         max_cloud_pct=request.max_cloud_pct,
     )
 
-    # Analyze the after period.
     after_result = get_ndvi_for_period(
         aoi,
         request.after_start,
@@ -137,7 +356,6 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
         max_cloud_pct=request.max_cloud_pct,
     )
 
-    # Calculate relative NDVI change.
     change_result = compute_change(
         before_result["mean_ndvi"],
         after_result["mean_ndvi"],
@@ -155,19 +373,27 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
 
     before = period_payload(before_result)
     after = period_payload(after_result)
+    labels = report_labels(request)
+    hindi = is_hindi(request)
 
-    # Collect data-coverage warnings.
     coverage_warnings = []
 
-    if before["coverage_warning"]:
-        coverage_warnings.append(
-            f"Before period: {before['coverage_warning']}"
-        )
+    before_warning = translate_coverage_warning(
+        before["coverage_warning"],
+        request,
+        labels["before_warning"],
+    )
+    after_warning = translate_coverage_warning(
+        after["coverage_warning"],
+        request,
+        labels["after_warning"],
+    )
 
-    if after["coverage_warning"]:
-        coverage_warnings.append(
-            f"After period: {after['coverage_warning']}"
-        )
+    if before_warning:
+        coverage_warnings.append(before_warning)
+
+    if after_warning:
+        coverage_warnings.append(after_warning)
 
     low_coverage = (
         before["coverage_percent"] < COVERAGE_WARNING_THRESHOLD
@@ -175,29 +401,59 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
     )
 
     original_classification = change_result["direction"]
+    translated_classification = (
+        translate_classification(
+    original_classification,
+    labels,
+)
+        if hindi
+        else original_classification
+    )
 
     if low_coverage and original_classification:
-        classification = (
-            f"Provisional result — {original_classification}; "
-            "low valid-pixel coverage"
-        )
-
-        note = (
-            "This comparison has low valid-pixel coverage in at least one "
-            "period. Treat the apparent NDVI change as provisional. Seasonal "
-            "variation, cloud masking, and image availability may affect the "
-            "result. NDVI change alone does not confirm vegetation damage "
-            "or flooding."
-        )
+        if hindi:
+            classification = (
+                f"{labels['provisional_classification']} — "
+                f"{translated_classification}; {labels['low_coverage']}"
+            )
+            note = (
+                "कम से कम एक अवधि में उपयोग योग्य पिक्सेल कवरेज कम है। "
+                "NDVI परिवर्तन को प्रारंभिक परिणाम मानें। मौसम, बादलों को "
+                "हटाने की प्रक्रिया और चित्रों की उपलब्धता परिणाम को प्रभावित "
+                "कर सकते हैं। केवल NDVI परिवर्तन से बाढ़ या वनस्पति क्षति की "
+                "पुष्टि नहीं होती।"
+            )
+        else:
+            classification = (
+                f"Provisional result — {original_classification}; "
+                "low valid-pixel coverage"
+            )
+            note = (
+                "This comparison has low valid-pixel coverage in at least "
+                "one period. Treat the apparent NDVI change as provisional. "
+                "Seasonal variation, cloud masking, and image availability "
+                "may affect the result. NDVI change alone does not confirm "
+                "vegetation damage or flooding."
+            )
     else:
-        classification = original_classification
-
-        note = (
-            "NDVI change indicates a change in vegetation greenness. It does "
-            "not independently confirm flooding, vegetation damage, or "
-            "whether an area is safe. Seasonal differences and image "
-            "availability can affect the results."
+        classification = (
+            translated_classification if hindi else original_classification
         )
+
+        if hindi:
+            note = (
+                "NDVI में बदलाव वनस्पति की हरियाली में बदलाव का संकेत देता है। "
+                "यह अपने आप में बाढ़, वनस्पति क्षति या किसी क्षेत्र की सुरक्षा "
+                "की पुष्टि नहीं करता। मौसम और उपग्रह चित्रों की उपलब्धता "
+                "परिणाम को प्रभावित कर सकती है।"
+            )
+        else:
+            note = (
+                "NDVI change indicates a change in vegetation greenness. It "
+                "does not independently confirm flooding, vegetation damage, "
+                "or whether an area is safe. Seasonal differences and image "
+                "availability can affect the results."
+            )
 
     return {
         "before": before,
@@ -243,17 +499,16 @@ def analyze_change(request: ChangeDetectionRequest):
 
 @router.post("/analyze/change/pdf")
 def analyze_change_pdf(request: ChangeDetectionRequest):
-    """Generate and download a PDF report of the NDVI analysis."""
+    """Generate and download a PDF report in the selected language."""
 
     try:
         from reportlab.lib import colors
         from reportlab.lib.enums import TA_CENTER
         from reportlab.lib.pagesizes import letter
-        from reportlab.lib.styles import (
-            getSampleStyleSheet,
-            ParagraphStyle,
-        )
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib.units import inch
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.platypus import (
             SimpleDocTemplate,
             Paragraph,
@@ -264,7 +519,35 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         )
 
         result = run_analysis(request)
+        labels = report_labels(request)
+        hindi = is_hindi(request)
         buffer = BytesIO()
+
+        font_name = "Helvetica"
+
+        if hindi:
+            font_path = (
+                Path(__file__).resolve().parents[1]
+                / "assets"
+                / "NotoSansDevanagari-Regular.ttf"
+            )
+
+            if not font_path.is_file():
+                raise RuntimeError(
+                    "Hindi font not found at "
+                    "app/assets/NotoSansDevanagari-Regular.ttf"
+                )
+
+            if "PrakritiHindi" not in pdfmetrics.getRegisteredFontNames():
+                pdfmetrics.registerFont(
+                    TTFont(
+                        "PrakritiHindi",
+                        str(font_path),
+                        shapable=True,
+                    )
+                )
+
+            font_name = "PrakritiHindi"
 
         document = SimpleDocTemplate(
             buffer,
@@ -273,11 +556,16 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
             leftMargin=0.55 * inch,
             topMargin=0.5 * inch,
             bottomMargin=0.5 * inch,
-            title="PRAKRITI NDVI Change Report",
+            title=labels["title"],
             author="PRAKRITI",
         )
 
         styles = getSampleStyleSheet()
+
+        if hindi:
+            for style_name in ("Normal", "Italic", "Title", "Heading2"):
+                styles[style_name].fontName = font_name
+
         styles["Title"].textColor = colors.HexColor("#172554")
         styles["Title"].alignment = TA_CENTER
         styles["Title"].spaceAfter = 5
@@ -285,6 +573,7 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         subtitle_style = ParagraphStyle(
             "Subtitle",
             parent=styles["Normal"],
+            fontName=font_name,
             alignment=TA_CENTER,
             textColor=colors.HexColor("#64748b"),
             spaceAfter=16,
@@ -293,6 +582,7 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         warning_style = ParagraphStyle(
             "CoverageWarning",
             parent=styles["Normal"],
+            fontName=font_name,
             textColor=colors.HexColor("#92400e"),
             leading=14,
         )
@@ -300,24 +590,42 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         interpretation_style = ParagraphStyle(
             "Interpretation",
             parent=styles["Italic"],
+            fontName=font_name,
             leading=14,
             spaceBefore=3,
         )
 
         story = [
-            Paragraph(
-                "PRAKRITI — NDVI Change Analysis",
-                styles["Title"],
-            ),
-            Paragraph(
-                "Satellite-based vegetation comparison report",
-                subtitle_style,
-            ),
+            Paragraph(escape(labels["title"]), styles["Title"]),
+            Paragraph(escape(labels["subtitle"]), subtitle_style),
         ]
 
+        header_cell_style = ParagraphStyle(
+            "TableHeaderCell",
+            parent=styles["Normal"],
+            fontName=font_name,
+            textColor=colors.white,
+        )
+
+        def safe_cell(value, style=None):
+            """Escape text before putting it into a ReportLab Paragraph."""
+            return Paragraph(
+                escape(str(value)),
+                style or styles["Normal"],
+            )
+
         def add_table(data, widths):
+            # Paragraph cells allow long Hindi labels to wrap correctly.
+            paragraph_data = [
+                [
+                    safe_cell(cell, header_cell_style if row_index == 0 else None)
+                    for cell in row
+                ]
+                for row_index, row in enumerate(data)
+            ]
+
             table = Table(
-                data,
+                paragraph_data,
                 colWidths=widths,
                 repeatRows=1,
             )
@@ -347,6 +655,7 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
                             colors.HexColor("#f8fafc"),
                         ],
                     ),
+                    ("FONTNAME", (0, 0), (-1, -1), font_name),
                     ("PADDING", (0, 0), (-1, -1), 6),
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ])
@@ -356,23 +665,18 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
 
         # Area of interest.
         story.append(
-            Paragraph("Area of Interest", styles["Heading2"])
+            Paragraph(escape(labels["aoi"]), styles["Heading2"])
         )
 
         aoi_data = [
-            ["Coordinate", "Value"],
-            ["West longitude", f"{request.west:.6f}"],
-            ["South latitude", f"{request.south:.6f}"],
-            ["East longitude", f"{request.east:.6f}"],
-            ["North latitude", f"{request.north:.6f}"],
+            [labels["coordinate"], labels["value"]],
+            [labels["west"], f"{request.west:.6f}"],
+            [labels["south"], f"{request.south:.6f}"],
+            [labels["east"], f"{request.east:.6f}"],
+            [labels["north"], f"{request.north:.6f}"],
         ]
 
-        story.append(
-            add_table(
-                aoi_data,
-                [2.2 * inch, 3.5 * inch],
-            )
-        )
+        story.append(add_table(aoi_data, [2.2 * inch, 3.5 * inch]))
         story.append(Spacer(1, 16))
 
         # Comparison periods.
@@ -380,46 +684,46 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         after = result["after"]
 
         story.append(
-            Paragraph("Comparison Periods", styles["Heading2"])
+            Paragraph(escape(labels["periods"]), styles["Heading2"])
         )
 
         period_data = [
-            ["Metric", "Before period", "After period"],
+            [labels["metric"], labels["before"], labels["after"]],
             [
-                "Date range",
-                f"{request.before_start} to {request.before_end}",
-                f"{request.after_start} to {request.after_end}",
+                labels["date_range"],
+                f"{request.before_start} {labels['date_to']} {request.before_end}",
+                f"{request.after_start} {labels['date_to']} {request.after_end}",
             ],
             [
-                "Mean NDVI",
+                labels["mean_ndvi"],
                 (
                     f"{before['mean_ndvi']:.6f}"
                     if before["mean_ndvi"] is not None
-                    else "Not available"
+                    else labels["not_available"]
                 ),
                 (
                     f"{after['mean_ndvi']:.6f}"
                     if after["mean_ndvi"] is not None
-                    else "Not available"
+                    else labels["not_available"]
                 ),
             ],
             [
-                "Satellite scenes",
+                labels["scenes"],
                 str(before["scenes"]),
                 str(after["scenes"]),
             ],
             [
-                "Valid pixels",
+                labels["valid_pixels"],
                 f"{before['valid_pixel_count']:,}",
                 f"{after['valid_pixel_count']:,}",
             ],
             [
-                "Total sampled pixels",
+                labels["total_pixels"],
                 f"{before['total_pixel_count']:,}",
                 f"{after['total_pixel_count']:,}",
             ],
             [
-                "Valid-pixel coverage",
+                labels["coverage"],
                 f"{before['coverage_percent']:.2f}%",
                 f"{after['coverage_percent']:.2f}%",
             ],
@@ -437,14 +741,14 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         if result["coverage_warnings"]:
             warning_items = [
                 Paragraph(
-                    "Valid-Pixel Coverage Warnings",
+                    escape(labels["warnings"]),
                     styles["Heading2"],
                 )
             ]
 
             for warning in result["coverage_warnings"]:
                 warning_items.append(
-                    Paragraph(warning, warning_style)
+                    Paragraph(escape(warning), warning_style)
                 )
                 warning_items.append(Spacer(1, 4))
 
@@ -468,6 +772,7 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
                         0.8,
                         colors.HexColor("#f59e0b"),
                     ),
+                    ("FONTNAME", (0, 0), (-1, -1), font_name),
                     ("LEFTPADDING", (0, 0), (-1, -1), 9),
                     ("RIGHTPADDING", (0, 0), (-1, -1), 9),
                     ("TOPPADDING", (0, 0), (-1, -1), 8),
@@ -482,12 +787,19 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
                 ])
             )
 
+        coverage_explanation = (
+    f"{labels['coverage_explanation']}: "
+    f"{COVERAGE_WARNING_THRESHOLD:.0f}%"
+    if hindi
+    else (
+        f"{labels['coverage_explanation']}: "
+        f"{COVERAGE_WARNING_THRESHOLD:.0f}%."
+    )
+)
+
         story.append(
             Paragraph(
-                "Coverage is the percentage of sampled AOI pixels with "
-                "usable NDVI after masking. The warning threshold is "
-                f"{COVERAGE_WARNING_THRESHOLD:.0f}%. Coverage alone does "
-                "not guarantee imagery quality.",
+                escape(coverage_explanation),
                 styles["Italic"],
             )
         )
@@ -495,7 +807,7 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
 
         # Analysis results.
         story.append(
-            Paragraph("Analysis Results", styles["Heading2"])
+            Paragraph(escape(labels["results"]), styles["Heading2"])
         )
 
         change = result["change_percent"]
@@ -503,92 +815,93 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         change_text = (
             f"{change:+.1f}%"
             if isinstance(change, (int, float))
-            else "Not available"
+            else labels["not_available"]
         )
 
         story.append(
             Paragraph(
-                f"NDVI change: {change_text}",
+                escape(f"{labels['change']}: {change_text}"),
                 styles["Normal"],
             )
         )
 
         story.append(
             Paragraph(
-                f"Classification: {result['classification']}",
+                escape(
+                    f"{labels['classification']}: "
+                    f"{result['classification']}"
+                ),
                 styles["Normal"],
             )
         )
-
-        # Interpretation based on the actual analysis values.
         story.append(Spacer(1, 8))
 
+        # Interpretation.
         after_coverage = after["coverage_percent"]
         coverage_threshold = result["coverage_warning_threshold"]
 
         if isinstance(change, (int, float)):
             if change < 0:
                 change_description = (
-                    f"NDVI decreased by {abs(change):.1f}%"
+                    f"{labels['ndvi_decreased_by']} {abs(change):.1f}%"
                 )
             elif change > 0:
                 change_description = (
-                    f"NDVI increased by {change:.1f}%"
+                    f"{labels['ndvi_increased_by']} {change:.1f}%"
                 )
             else:
-                change_description = "NDVI showed no relative change"
+                change_description = labels["no_change"]
         else:
-            change_description = (
-                "NDVI change could not be calculated"
-            )
+            change_description = labels["could_not_calculate"]
 
         if isinstance(after_coverage, (int, float)):
             if after_coverage < coverage_threshold:
-                coverage_sentence = (
-                    f"However, only {after_coverage:.2f}% of sampled "
-                    "pixels were usable in the after period, below the "
-                    f"{coverage_threshold:.0f}% coverage threshold. "
-                )
+                if hindi:
+                    coverage_sentence = (
+                        f"{labels['coverage_sentence_low']} "
+                        f"{after_coverage:.2f}% "
+                        f"{labels['coverage_sentence_low_end']} "
+                        f"{labels['threshold']}: "
+                        f"{coverage_threshold:.0f}%. "
+                    )
+                else:
+                    coverage_sentence = (
+                        f"{labels['coverage_sentence_low']} "
+                        f"{after_coverage:.2f}% "
+                        f"{labels['coverage_sentence_low_end']} "
+                        f"Threshold: {coverage_threshold:.0f}%. "
+                    )
             else:
                 coverage_sentence = (
-                    "Valid-pixel coverage in the after period was "
+                    f"{labels['coverage_sentence_ok']} "
                     f"{after_coverage:.2f}%. "
                 )
         else:
-            coverage_sentence = (
-                "After-period coverage was not available. "
-            )
+            coverage_sentence = labels["coverage_unavailable"] + " "
 
-        low_coverage = bool(result["coverage_warnings"])
-
-        if low_coverage:
+        if result["coverage_warnings"]:
             interpretation = (
-                f"Interpretation: {change_description} between the two "
-                "periods. "
+                f"{labels['interpretation']}: "
+                f"{change_description}. "
                 f"{coverage_sentence}"
-                "Treat this comparison as provisional. Seasonal variation, "
-                "cloud masking, and image availability may affect the result. "
-                "NDVI change alone does not confirm vegetation damage "
-                "or flooding."
+                f"{labels['provisional']} "
+                f"{labels['caution']}"
             )
         else:
             interpretation = (
-                f"Interpretation: {change_description} between the two "
-                "periods. "
+                f"{labels['interpretation']}: "
+                f"{change_description}. "
                 f"{coverage_sentence}"
-                "Seasonal variation, cloud masking, and image availability "
-                "may affect the result. NDVI change alone does not confirm "
-                "vegetation damage or flooding."
+                f"{labels['caution']}"
             )
 
         story.append(
             Paragraph(
-                interpretation,
+                escape(interpretation),
                 interpretation_style,
             )
         )
 
-        # Generate the PDF.
         document.build(story)
         buffer.seek(0)
 
