@@ -4,6 +4,7 @@ Earth Engine is replaced with fixed numbers, so these tests need no
 credentials and no internet. A fake key file is created in a temp folder.
 """
 import re
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -24,6 +25,7 @@ def english_words(text: str) -> list:
 def make_period(mean, coverage=95.0, warning=None):
     return {
         "mean_ndvi": mean,
+        "composite_image": MagicMock(),
         "scene_count": 5,
         "valid_pixel_count": 9500,
         "total_pixel_count": 10000,
@@ -56,6 +58,8 @@ def fake_ee(monkeypatch, tmp_path):
     monkeypatch.setattr(cd, "init_earth_engine", lambda *a, **k: None)
     monkeypatch.setattr(cd, "resolve_aoi", lambda *a, **k: "fake-aoi")
     monkeypatch.setattr(cd, "get_ndvi_for_period", fake_period)
+    # Water estimation is independent of NDVI; return None to skip it.
+    monkeypatch.setattr(cd, "get_mndwi_water_extent", lambda *a, **k: None)
     return settings
 
 
@@ -133,8 +137,14 @@ def test_json_unknown_language_falls_back_to_english(fake_ee):
 def test_json_numbers_identical_in_both_languages(fake_ee):
     hindi, english = analyse("hi"), analyse("en")
     assert hindi["change_percent"] == english["change_percent"]
-    assert hindi["before"] == english["before"]
-    assert hindi["after"] == english["after"]
+    # Compare only the numeric NDVI fields; the 'composite_image' mock
+    # object identity will differ between calls but the numbers must match.
+    for period in ("before", "after"):
+        for key in ("mean_ndvi", "scenes", "coverage_percent",
+                    "valid_pixel_count", "total_pixel_count"):
+            assert hindi[period].get(key) == english[period].get(key), (
+                f"{period}.{key} differs between Hindi and English responses"
+            )
 
 
 # ------------------------------------------------- HTTP + PDF (use TestClient)

@@ -265,6 +265,7 @@ MOCK_INIT = "app.routes.change_detection.init_earth_engine"
 MOCK_RESOLVE = "app.routes.change_detection.resolve_aoi"
 MOCK_NDVI = "app.routes.change_detection.get_ndvi_for_period"
 MOCK_CHANGE = "app.routes.change_detection.compute_change"
+MOCK_WATER = "app.routes.change_detection.get_mndwi_water_extent"
 
 
 class TestRunAnalysisHindi(unittest.TestCase):
@@ -286,6 +287,7 @@ class TestRunAnalysisHindi(unittest.TestCase):
             patch(MOCK_RESOLVE),
             patch(MOCK_NDVI, side_effect=[before, after]),
             patch(MOCK_CHANGE, return_value=change),
+            patch(MOCK_WATER, return_value=None),
             patch("pathlib.Path.is_file", return_value=True),
         ):
             return run_analysis(req)
@@ -301,6 +303,7 @@ class TestRunAnalysisHindi(unittest.TestCase):
             patch(MOCK_RESOLVE),
             patch(MOCK_NDVI, side_effect=[before, after]),
             patch(MOCK_CHANGE, return_value=change),
+            patch(MOCK_WATER, return_value=None),
             patch("pathlib.Path.is_file", return_value=True),
         ):
             return run_analysis(req)

@@ -85,6 +85,7 @@ def mask_sentinel2_clouds(image: ee.Image) -> ee.Image:
         0  = No data
         1  = Saturated or defective pixels
         3  = Cloud shadows
+        7  = Low-probability cloud or unclassified
         8  = Clouds, medium probability
         9  = Clouds, high probability
         10 = Cirrus
@@ -98,6 +99,7 @@ def mask_sentinel2_clouds(image: ee.Image) -> ee.Image:
         scl.neq(0)
         .And(scl.neq(1))
         .And(scl.neq(3))
+        .And(scl.neq(7))
         .And(scl.neq(8))
         .And(scl.neq(9))
         .And(scl.neq(10))
@@ -226,77 +228,100 @@ def get_valid_pixel_coverage(
     scale: int = 10,
 ) -> dict:
     """
-    Calculate valid NDVI pixel coverage over the entire AOI.
+    Calculate valid-pixel coverage using pixel area.
+    Pixel counts are returned for reporting, while coverage_percent
+    is calculated from valid area divided by total area.
 
-    Both counts use the same fixed projection and sampling scale:
-    - total_pixel_count: all grid pixels sampled inside the AOI
-    - valid_pixel_count: sampled pixels with valid NDVI after masking
-
-    Coverage = valid pixels / total sampled pixels * 100.
     """
     if scale <= 0:
         raise ValueError("scale must be greater than zero.")
 
-    # Use the NDVI image's native projection as the common grid.
     projection = ndvi_image.projection()
 
-    # A constant image clipped to the AOI counts the full sampled area.
     total_image = (
         ee.Image.constant(1)
-        .rename("total")
+        .rename("total_pixels")
         .setDefaultProjection(projection)
         .clip(aoi)
     )
 
-    # Convert the NDVI mask into explicit 1 (valid) and 0 (invalid)
-    # values, then fill masked locations with zero.
     valid_image = (
         ndvi_image.mask()
         .gt(0)
         .unmask(0, False)
-        .rename("valid")
+        .rename("valid_pixels")
         .setDefaultProjection(projection)
         .clip(aoi)
     )
 
-    # Keep the two bands separate so each is summed using its own values.
-    counts = (
-        total_image
-        .addBands(valid_image)
-        .reduceRegion(
-            reducer=ee.Reducer.sum(),
-            geometry=aoi,
-            scale=scale,
-            crs=projection,
-            maxPixels=1e9,
-            tileScale=4,
-        )
-        .getInfo()
+    pixel_area = ee.Image.pixelArea().setDefaultProjection(
+        projection
     )
 
-    total_value = counts.get("total")
-    valid_value = counts.get("valid")
+    total_area_image = (
+        pixel_area
+        .updateMask(total_image)
+        .rename("total_area")
+        .clip(aoi)
+    )
 
-    if total_value is None or valid_value is None:
+    valid_area_image = (
+        pixel_area
+        .updateMask(valid_image)
+        .rename("valid_area")
+        .clip(aoi)
+    )
+
+    combined = (
+        total_image
+        .addBands(valid_image)
+        .addBands(total_area_image)
+        .addBands(valid_area_image)
+    )
+
+    stats = combined.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=aoi,
+        scale=scale,
+        crs=projection,
+        maxPixels=1e9,
+        tileScale=4,
+    ).getInfo()
+
+    total_count = stats.get("total_pixels")
+    valid_count = stats.get("valid_pixels")
+    total_area = stats.get("total_area")
+    valid_area = stats.get("valid_area")
+
+    if (
+        total_count is None
+        or valid_count is None
+        or total_area is None
+        or valid_area is None
+    ):
         raise ValueError(
             "Could not calculate pixel coverage for this AOI. "
             "Check the coordinates and satellite imagery."
         )
 
-    total = int(total_value)
-    valid = int(valid_value)
+    total_count = int(total_count)
+    valid_count = int(valid_count)
+    total_area = float(total_area)
+    valid_area = float(valid_area)
 
-    if total <= 0:
+    if total_count <= 0 or total_area <= 0:
         raise ValueError(
             "No sampled pixels were found inside the AOI."
         )
 
-    valid = min(max(valid, 0), total)
-    coverage_percent = valid / total * 100.0
+    valid_count = min(max(valid_count, 0), total_count)
+    valid_area = min(max(valid_area, 0.0), total_area)
+
+    coverage_percent = valid_area / total_area * 100.0
 
     return {
-        "valid_pixel_count": valid,
-        "total_pixel_count": total,
+        "valid_pixel_count": valid_count,
+        "total_pixel_count": total_count,
         "coverage_percent": round(coverage_percent, 2),
     }
 
@@ -441,4 +466,80 @@ def compute_change(
             "damage, or whether an area is safe. Cloud cover, seasonal "
             "changes, and image availability can affect the results."
         ),
+    }
+
+# ---------------------------------------------------------------------------
+# Step 9: Estimate water extent using MNDWI
+# ---------------------------------------------------------------------------
+
+def get_mndwi_water_extent(
+    composite: ee.Image,
+    aoi: ee.Geometry,
+) -> dict:
+    """
+    Estimate water-like surface area using the Modified Normalized
+    Difference Water Index (MNDWI).
+
+    This is an estimate, not definitive flood detection.
+    """
+    green = composite.select("B3")
+    swir = composite.select("B11")
+
+    denominator = green.add(swir)
+
+    mndwi = (
+        green.subtract(swir)
+        .divide(denominator.where(denominator.eq(0), 1))
+        .rename("MNDWI")
+    )
+
+    # Positive MNDWI is a simple indicator of water-like surfaces.
+    water_mask = mndwi.gt(0).rename("water")
+
+    pixel_area = ee.Image.pixelArea()
+
+    total_area = pixel_area.reduceRegion(
+        reducer=ee.Reducer.sum(),
+        geometry=aoi,
+        scale=20,
+        maxPixels=1_000_000_000,
+        bestEffort=True,
+    ).get("area")
+
+    water_area = (
+        pixel_area.updateMask(water_mask)
+        .reduceRegion(
+            reducer=ee.Reducer.sum(),
+            geometry=aoi,
+            scale=20,
+            maxPixels=1_000_000_000,
+            bestEffort=True,
+        )
+        .get("area")
+    )
+
+    total_area_m2 = ee.Number(total_area).getInfo()
+    water_area_m2 = ee.Number(
+        ee.Algorithms.If(
+            ee.Algorithms.IsEqual(water_area, None),
+            0,
+            water_area,
+        )
+    ).getInfo()
+
+    total_area_km2 = total_area_m2 / 1_000_000
+    water_area_km2 = water_area_m2 / 1_000_000
+
+    water_percent = (
+        (water_area_m2 / total_area_m2) * 100
+        if total_area_m2 > 0
+        else 0
+    )
+
+    valid_area_km2 = total_area_km2 - water_area_km2
+
+    return {
+        "water_area_km2": round(water_area_km2, 4),
+        "valid_area_km2": round(valid_area_km2, 4),
+        "water_percent_valid": round(water_percent, 2),
     }

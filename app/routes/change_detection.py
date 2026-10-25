@@ -14,6 +14,7 @@ from app.services.ndvi_pipeline import (
     resolve_aoi,
     get_ndvi_for_period,
     compute_change,
+    get_mndwi_water_extent,
     COVERAGE_WARNING_THRESHOLD,
 )
 
@@ -127,6 +128,11 @@ def report_labels(request: ChangeDetectionRequest) -> dict:
                 "बाद की अवधि का कवरेज उपलब्ध नहीं था।"
             ),
             "threshold": "निर्धारित सीमा",
+            "water_extent": "अनुमानित जल विस्तार (MNDWI)",
+            "water_area": "जल जैसा क्षेत्रफल",
+            "valid_area": "वैध विश्लेषण क्षेत्र",
+            "water_percent": "वैध क्षेत्र का जल प्रतिशत",
+            "water_not_available": "जल अनुमान उपलब्ध नहीं",
         }
 
     return {
@@ -187,6 +193,11 @@ def report_labels(request: ChangeDetectionRequest) -> dict:
         ),
         "coverage_unavailable": "After-period coverage was not available.",
         "threshold": "Threshold",
+        "water_extent": "Estimated Water Extent (MNDWI)",
+        "water_area": "Water-like area (km\u00b2)",
+        "valid_area": "Valid analysed area (km\u00b2)",
+        "water_percent": "Water % of valid area",
+        "water_not_available": "Not available",
     }
 
 
@@ -455,6 +466,36 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
                 "availability can affect the results."
             )
 
+    # ---------------------------------------------------------------------------
+    # Water extent estimation (MNDWI) — independent of NDVI; failures are
+    # caught silently so that the NDVI report always succeeds.
+    # ---------------------------------------------------------------------------
+
+    def _estimate_water(composite_image, period_label: str):
+        """Return water-extent dict, or None if estimation fails."""
+        try:
+            return get_mndwi_water_extent(composite_image, aoi)
+        except Exception as water_error:
+            # Log the reason but do not expose credentials or stack details.
+            print(
+                f"PRAKRITI water-analysis warning ({period_label}): "
+                f"{type(water_error).__name__}: {water_error}"
+            )
+            return None
+
+    water_before = _estimate_water(
+        before_result["composite_image"], "before period"
+    )
+    water_after = _estimate_water(
+        after_result["composite_image"], "after period"
+    )
+
+    water_note = (
+        "MNDWI-based water extent is an estimate. Seasonal conditions, "
+        "shadows, and image quality can affect the result. It does not "
+        "independently confirm flooding, drought, or encroachment."
+    )
+
     return {
         "before": before,
         "after": after,
@@ -464,6 +505,11 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
         "max_cloud_pct": request.max_cloud_pct,
         "coverage_warning_threshold": COVERAGE_WARNING_THRESHOLD,
         "coverage_warnings": coverage_warnings,
+        "water": {
+            "before": water_before,
+            "after": water_after,
+            "note": water_note,
+        },
     }
 
 
@@ -732,6 +778,60 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         story.append(
             add_table(
                 period_data,
+                [1.75 * inch, 2.0 * inch, 2.0 * inch],
+            )
+        )
+        story.append(Spacer(1, 14))
+
+        # Water extent section.
+        water_result = result.get("water", {}) or {}
+        water_before_data = water_result.get("before")
+        water_after_data = water_result.get("after")
+
+        def _fmt_water_val(data, key):
+            """Format a water value, showing N/A if data is missing."""
+            if data is None:
+                return labels["water_not_available"]
+            val = data.get(key)
+            if val is None:
+                return labels["water_not_available"]
+            return f"{float(val):.4f}"
+
+        def _fmt_water_pct(data):
+            """Format water percentage, showing N/A if data is missing."""
+            if data is None:
+                return labels["water_not_available"]
+            val = data.get("water_percent_valid")
+            if val is None:
+                return labels["water_not_available"]
+            return f"{float(val):.2f}%"
+
+        story.append(
+            Paragraph(escape(labels["water_extent"]), styles["Heading2"])
+        )
+
+        water_data = [
+            [labels["metric"], labels["before"], labels["after"]],
+            [
+                labels["water_area"],
+                _fmt_water_val(water_before_data, "water_area_km2"),
+                _fmt_water_val(water_after_data, "water_area_km2"),
+            ],
+            [
+                labels["valid_area"],
+                _fmt_water_val(water_before_data, "valid_area_km2"),
+                _fmt_water_val(water_after_data, "valid_area_km2"),
+            ],
+            [
+                labels["water_percent"],
+                _fmt_water_pct(water_before_data),
+                _fmt_water_pct(water_after_data),
+            ],
+        ]
+
+        story.append(
+            add_table(
+                water_data,
                 [1.75 * inch, 2.0 * inch, 2.0 * inch],
             )
         )
