@@ -4,3 +4,5 @@ earthengine-api==1.7.49
 reportlab==4.5.1
 pydantic==2.14.1
 python-dotenv==1.2.4
+uharfbuzz==0.57.0
+python-bidi==0.6.12
