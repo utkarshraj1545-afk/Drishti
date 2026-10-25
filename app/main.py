@@ -15,6 +15,8 @@ allowed_origins = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "https://prakriti-blue.vercel.app",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
 ]
 
 vercel_url = os.getenv("FRONTEND_URL")
