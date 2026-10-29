@@ -1,0 +1,25 @@
+﻿=== BACKEND ===
+On branch main
+Your branch is up to date with 'origin/main'.
+
+Untracked files:
+  (use "git add <file>..." to include in what will be committed)
+	app/routes/change_detection.backup.py
+	app/routes/change_detection.pre-water-deploy.py
+	app/routes/change_detection.py.broken-backup
+	app/services/ndvi_pipeline.pre-water-deploy.py
+	change_detection_backup.py
+	change_detection_local_backup.diff
+	"erskumarOneDriveDrishti\357\200\242 diff --name-only --diff-filter=U778899 git -C \357\200\242C\357\200\272UserskumarOneDriveDrishti\357\200\242 diff --name-only --diff-filter=U"
+	hindi-report.pdf
+	ndvi_pipeline_local_backup.diff
+	test_output.txt
+
+nothing added to commit but untracked files present (use "git add" to track)
+
+=== LOG ===
+b24ecae feat: add MNDWI water extent analysis, wire into route and PDF
+b95c5c7 Allow local frontend on port 3001
+e2e75aa Merge pull request #3 from utkarshraj1545-afk/replace-with-repaired-backend
+6386434 Add Hindi analysis and PDF report support
+579bfa4 Merge pull request #2 from utkarshraj1545-afk/replace-with-repaired-backend

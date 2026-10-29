@@ -1,0 +1,12 @@
+﻿=== FRONTEND ===
+On branch main
+Your branch is up to date with 'origin/main'.
+
+nothing to commit, working tree clean
+
+=== LOG ===
+7c85722 feat: display MNDWI water extent results in PRAKRITI UI
+be5fdaf Remove accidental empty npm file
+11e4620 PRAKRITI: working end-to-end NDVI analysis and PDF
+24854f5 feat: add working DRISHTI frontend
+63bdf35 Initial commit from Create Next App

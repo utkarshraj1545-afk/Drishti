@@ -1,4 +1,4 @@
-
+import traceback
 from io import BytesIO
 from datetime import date
 import os
@@ -13,6 +13,7 @@ from app.services.ndvi_pipeline import (
     init_earth_engine,
     resolve_aoi,
     get_ndvi_for_period,
+    get_ndvi_time_series,
     compute_change,
     get_mndwi_water_extent,
     COVERAGE_WARNING_THRESHOLD,
@@ -24,11 +25,7 @@ SERVICE_ACCOUNT = os.getenv(
     "EARTH_ENGINE_SERVICE_ACCOUNT",
     "satquery-backend@satquery-ai-507509.iam.gserviceaccount.com",
 )
-
-_DEFAULT_KEY_PATH = (
-    Path(__file__).resolve().parents[2] / "secrets" / "key.json"
-)
-
+_DEFAULT_KEY_PATH = Path(__file__).resolve().parents[2] / "secrets" / "key.json"
 SERVICE_ACCOUNT_KEY = os.getenv(
     "EARTH_ENGINE_KEY_PATH",
     str(_DEFAULT_KEY_PATH),
@@ -40,14 +37,24 @@ class ChangeDetectionRequest(BaseModel):
     south: float
     east: float
     north: float
-
     before_start: str
     before_end: str
-
     after_start: str
     after_end: str
-
     language: str = "en"
+    max_cloud_pct: int = Field(default=80, ge=1, le=100)
+    location_name: str | None = Field(default=None, max_length=300)
+
+
+class TrendRequest(BaseModel):
+    """Request model for historical NDVI trend analysis."""
+    west: float
+    south: float
+    east: float
+    north: float
+    start_date: str
+    end_date: str
+    interval: str = Field(default="yearly", pattern="^(yearly|monthly)$")
     max_cloud_pct: int = Field(default=80, ge=1, le=100)
 
 
@@ -55,6 +62,8 @@ def is_hindi(request: ChangeDetectionRequest) -> bool:
     """Check whether the request asks for a Hindi report."""
     language = str(request.language).strip().lower().replace("_", "-")
     return language in {"hi", "hindi"} or language.startswith("hi-")
+
+
 def is_hindi_labels(labels: dict) -> bool:
     """Detect Hindi labels from the translated report text."""
     return any(
@@ -65,12 +74,12 @@ def is_hindi_labels(labels: dict) -> bool:
 
 def report_labels(request: ChangeDetectionRequest) -> dict:
     """Return report labels in the selected language."""
-
     if is_hindi(request):
         return {
             "title": "PRAKRITI — NDVI परिवर्तन विश्लेषण",
             "subtitle": "उपग्रह आधारित वनस्पति तुलना रिपोर्ट",
             "aoi": "अध्ययन क्षेत्र",
+            "location_name": "स्थान का नाम",
             "coordinate": "निर्देशांक",
             "value": "मान",
             "west": "पश्चिमी देशांतर",
@@ -90,10 +99,10 @@ def report_labels(request: ChangeDetectionRequest) -> dict:
             "coverage": "उपयोग योग्य पिक्सेल का प्रतिशत",
             "warnings": "डेटा कवरेज संबंधी चेतावनी",
             "coverage_explanation": (
-                 "यह प्रतिशत बताता है कि अध्ययन क्षेत्र के कितने "
-                 "पिक्सेल में उपयोग योग्य NDVI डेटा उपलब्ध था। "
-                 "अधिक कवरेज से पूरे क्षेत्र का आकलन बेहतर होता है।"
-             ),
+                "यह प्रतिशत बताता है कि अध्ययन क्षेत्र के कितने "
+                "पिक्सेल में उपयोग योग्य NDVI डेटा उपलब्ध था। "
+                "अधिक कवरेज से पूरे क्षेत्र का आकलन बेहतर होता है।"
+            ),
             "results": "विश्लेषण के परिणाम",
             "change": "NDVI में परिवर्तन",
             "classification": "वर्गीकरण",
@@ -124,9 +133,7 @@ def report_labels(request: ChangeDetectionRequest) -> dict:
             "coverage_sentence_ok": (
                 "बाद की अवधि में उपयोग योग्य पिक्सेल कवरेज"
             ),
-            "coverage_unavailable": (
-                "बाद की अवधि का कवरेज उपलब्ध नहीं था।"
-            ),
+            "coverage_unavailable": "बाद की अवधि का कवरेज उपलब्ध नहीं था।",
             "threshold": "निर्धारित सीमा",
             "water_extent": "अनुमानित जल विस्तार (MNDWI)",
             "water_area": "जल जैसा क्षेत्रफल",
@@ -139,6 +146,7 @@ def report_labels(request: ChangeDetectionRequest) -> dict:
         "title": "PRAKRITI — NDVI Change Analysis",
         "subtitle": "Satellite-based vegetation comparison report",
         "aoi": "Area of Interest",
+        "location_name": "Location name",
         "coordinate": "Coordinate",
         "value": "Value",
         "west": "West longitude",
@@ -194,74 +202,46 @@ def report_labels(request: ChangeDetectionRequest) -> dict:
         "coverage_unavailable": "After-period coverage was not available.",
         "threshold": "Threshold",
         "water_extent": "Estimated Water Extent (MNDWI)",
-        "water_area": "Water-like area (km\u00b2)",
-        "valid_area": "Valid analysed area (km\u00b2)",
+        "water_area": "Water-like area (km²)",
+        "valid_area": "Valid analysed area (km²)",
         "water_percent": "Water % of valid area",
         "water_not_available": "Not available",
     }
 
 
-
-
 def translate_classification(value, labels: dict):
     """Translate known classification values using the selected language."""
-
     hindi = is_hindi_labels(labels)
-
     if value is None:
         return labels["not_available"]
-
-    # Preserve the original classification in English mode.
     if not hindi:
         return str(value)
 
     normalized = str(value).strip().lower().replace("_", " ").replace("-", " ")
-
     if normalized in {
-        "vegetation gain",
-        "vegetation increased",
-        "vegetation increase",
-        "increase",
-        "increased",
-        "gain",
+        "vegetation gain", "vegetation increased", "vegetation increase",
+        "increase", "increased", "gain",
     }:
         return labels["increased"]
-
     if normalized in {
-        "vegetation loss",
-        "vegetation decreased",
-        "vegetation decrease",
-        "decrease",
-        "decreased",
-        "loss",
+        "vegetation loss", "vegetation decreased", "vegetation decrease",
+        "decrease", "decreased", "loss",
     }:
         return labels["decreased"]
-
-    if normalized in {
-        "no significant change",
-        "no change",
-        "unchanged",
-    }:
+    if normalized in {"no significant change", "no change", "unchanged"}:
         return labels["no_change"]
-
-    # Preserve unexpected classifications rather than mislabeling them.
     return str(value)
-
 
 
 def translate_coverage_warning(value, request, period_label):
     """Translate known coverage-warning text while preserving unknown details."""
-
     if not value:
         return None
-
     if not is_hindi(request):
         return f"{period_label}: {value}"
 
     text = str(value).strip()
     normalized = text.lower()
-
-    # Common coverage warnings used by the NDVI pipeline.
     if "coverage" in normalized and (
         "low" in normalized or "below" in normalized
     ):
@@ -269,44 +249,29 @@ def translate_coverage_warning(value, request, period_label):
             f"{period_label}: उपयोग योग्य पिक्सेल कवरेज कम है। "
             "इस अवधि के परिणाम को सावधानी से देखें।"
         )
-
     if "no usable" in normalized or "no valid" in normalized:
-        return (
-            f"{period_label}: उपयोग योग्य NDVI डेटा उपलब्ध नहीं था।"
-        )
-
-    # Preserve the source message if its exact meaning is unknown.
+        return f"{period_label}: उपयोग योग्य NDVI डेटा उपलब्ध नहीं था।"
     return f"{period_label}: {text}"
 
 
 def run_analysis(request: ChangeDetectionRequest) -> dict:
-    """Run the shared analysis used by both API endpoints."""
-
+    """Run the shared analysis used by both existing analysis endpoints."""
     print(
         f"DRISHTI DEBUG: language={request.language!r}, "
-        f"hindi={is_hindi(request)}, "
-        f"file={Path(__file__).resolve()}"
+        f"hindi={is_hindi(request)}, file={Path(__file__).resolve()}"
     )
 
     if request.west >= request.east:
-        raise ValueError(
-            "West longitude must be less than east longitude."
-        )
-
+        raise ValueError("West longitude must be less than east longitude.")
     if request.south >= request.north:
-        raise ValueError(
-            "South latitude must be less than north latitude."
-        )
-
+        raise ValueError("South latitude must be less than north latitude.")
     if not (
         -180 <= request.west <= 180
         and -180 <= request.east <= 180
         and -90 <= request.south <= 90
         and -90 <= request.north <= 90
     ):
-        raise ValueError(
-            "The supplied coordinates are outside valid ranges."
-        )
+        raise ValueError("The supplied coordinates are outside valid ranges.")
 
     date_fields = {
         "before_start": request.before_start,
@@ -314,9 +279,7 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
         "after_start": request.after_start,
         "after_end": request.after_end,
     }
-
     parsed_dates = {}
-
     for field_name, value in date_fields.items():
         try:
             parsed_dates[field_name] = date.fromisoformat(value)
@@ -326,47 +289,34 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
             ) from exc
 
     if parsed_dates["before_start"] > parsed_dates["before_end"]:
-        raise ValueError(
-            "Before-period start date must not follow its end date."
-        )
-
+        raise ValueError("Before-period start date must not follow its end date.")
     if parsed_dates["after_start"] > parsed_dates["after_end"]:
-        raise ValueError(
-            "After-period start date must not follow its end date."
-        )
+        raise ValueError("After-period start date must not follow its end date.")
 
     key_path = Path(SERVICE_ACCOUNT_KEY).expanduser()
-
     if not key_path.is_file():
         raise RuntimeError(
             "Google Earth Engine service-account key was not found. "
-            "Set EARTH_ENGINE_KEY_PATH to the path of your local key "
-            "JSON file. Keep that file private and outside shared ZIP files."
+            "Set EARTH_ENGINE_KEY_PATH to the path of your local key JSON "
+            "file. Keep that file private and outside shared ZIP files."
         )
 
     init_earth_engine(SERVICE_ACCOUNT, str(key_path))
-
     aoi = resolve_aoi(
-        request.west,
-        request.south,
-        request.east,
-        request.north,
+        request.west, request.south, request.east, request.north
     )
-
     before_result = get_ndvi_for_period(
         aoi,
         request.before_start,
         request.before_end,
         max_cloud_pct=request.max_cloud_pct,
     )
-
     after_result = get_ndvi_for_period(
         aoi,
         request.after_start,
         request.after_end,
         max_cloud_pct=request.max_cloud_pct,
     )
-
     change_result = compute_change(
         before_result["mean_ndvi"],
         after_result["mean_ndvi"],
@@ -386,23 +336,16 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
     after = period_payload(after_result)
     labels = report_labels(request)
     hindi = is_hindi(request)
-
     coverage_warnings = []
 
     before_warning = translate_coverage_warning(
-        before["coverage_warning"],
-        request,
-        labels["before_warning"],
+        before["coverage_warning"], request, labels["before_warning"]
     )
     after_warning = translate_coverage_warning(
-        after["coverage_warning"],
-        request,
-        labels["after_warning"],
+        after["coverage_warning"], request, labels["after_warning"]
     )
-
     if before_warning:
         coverage_warnings.append(before_warning)
-
     if after_warning:
         coverage_warnings.append(after_warning)
 
@@ -410,15 +353,10 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
         before["coverage_percent"] < COVERAGE_WARNING_THRESHOLD
         or after["coverage_percent"] < COVERAGE_WARNING_THRESHOLD
     )
-
     original_classification = change_result["direction"]
     translated_classification = (
-        translate_classification(
-    original_classification,
-    labels,
-)
-        if hindi
-        else original_classification
+        translate_classification(original_classification, labels)
+        if hindi else original_classification
     )
 
     if low_coverage and original_classification:
@@ -450,7 +388,6 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
         classification = (
             translated_classification if hindi else original_classification
         )
-
         if hindi:
             note = (
                 "NDVI में बदलाव वनस्पति की हरियाली में बदलाव का संकेत देता है। "
@@ -466,27 +403,21 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
                 "availability can affect the results."
             )
 
-    # ---------------------------------------------------------------------------
-    # Water extent estimation (MNDWI) — independent of NDVI; failures are
-    # caught silently so that the NDVI report always succeeds.
-    # ---------------------------------------------------------------------------
-
-    def _estimate_water(composite_image, period_label: str):
-        """Return water-extent dict, or None if estimation fails."""
+    def estimate_water(composite_image, period_label: str):
+        """Return water-extent data or None if estimation fails."""
         try:
             return get_mndwi_water_extent(composite_image, aoi)
         except Exception as water_error:
-            # Log the reason but do not expose credentials or stack details.
             print(
                 f"PRAKRITI water-analysis warning ({period_label}): "
                 f"{type(water_error).__name__}: {water_error}"
             )
             return None
 
-    water_before = _estimate_water(
+    water_before = estimate_water(
         before_result["composite_image"], "before period"
     )
-    water_after = _estimate_water(
+    water_after = estimate_water(
         after_result["composite_image"], "after period"
     )
 
@@ -514,29 +445,91 @@ def run_analysis(request: ChangeDetectionRequest) -> dict:
 
 
 def handle_analysis_error(error: Exception) -> None:
-    """Convert analysis failures into suitable HTTP responses."""
-
+    """Log the full traceback and return a suitable HTTP response."""
     if isinstance(error, HTTPException):
         raise error
-
     if isinstance(error, ValueError):
-        raise HTTPException(
-            status_code=400,
-            detail=str(error),
-        ) from error
+        raise HTTPException(status_code=400, detail=str(error)) from error
 
-    print(f"PRAKRITI analysis error: {error}")
+    print("\n" + "=" * 70)
+    print("PRAKRITI BACKEND ERROR")
+    print("=" * 70)
+    print(f"Error type: {type(error).__name__}")
+    print(f"Error message: {error}")
+    print("\nFull traceback:")
+    traceback.print_exception(type(error), error, error.__traceback__)
+    print("=" * 70 + "\n")
 
     raise HTTPException(
         status_code=500,
-        detail="Analysis failed. Check the backend logs for details.",
+        detail="Analysis failed. Check the backend terminal logs.",
     ) from error
+
+
+@router.post("/analyze/trend")
+def analyze_ndvi_trend(request: TrendRequest):
+    """Return historical NDVI observations for a selected AOI and date range."""
+    try:
+        if not (
+            -180 <= request.west <= 180
+            and -180 <= request.east <= 180
+            and -90 <= request.south <= 90
+            and -90 <= request.north <= 90
+        ):
+            raise ValueError(
+                "Coordinates are outside valid longitude/latitude ranges."
+            )
+        if request.west >= request.east:
+            raise ValueError("West longitude must be less than east longitude.")
+        if request.south >= request.north:
+            raise ValueError("South latitude must be less than north latitude.")
+
+        try:
+            start = date.fromisoformat(request.start_date)
+            end = date.fromisoformat(request.end_date)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "start_date and end_date must use YYYY-MM-DD format."
+            ) from exc
+
+        if start > end:
+            raise ValueError("start_date must not be later than end_date.")
+
+        key_path = Path(SERVICE_ACCOUNT_KEY).expanduser()
+        if not key_path.is_file():
+            raise RuntimeError(
+                "Earth Engine service-account key was not found. "
+                "Check EARTH_ENGINE_KEY_PATH."
+            )
+
+        init_earth_engine(SERVICE_ACCOUNT, str(key_path))
+        aoi = resolve_aoi(
+            request.west, request.south, request.east, request.north
+        )
+        trend = get_ndvi_time_series(
+            aoi=aoi,
+            start_date=start.isoformat(),
+            end_date=end.isoformat(),
+            interval=request.interval,
+            max_cloud_pct=request.max_cloud_pct,
+        )
+
+        return {
+            "success": True,
+            "interval": trend["interval"],
+            "start_date": trend["start_date"],
+            "end_date": trend["end_date"],
+            "max_cloud_pct": request.max_cloud_pct,
+            "coverage_warning_threshold": COVERAGE_WARNING_THRESHOLD,
+            "observations": trend["observations"],
+        }
+    except Exception as error:
+        handle_analysis_error(error)
 
 
 @router.post("/analyze/change")
 def analyze_change(request: ChangeDetectionRequest):
     """Return NDVI change analysis as JSON."""
-
     try:
         return run_analysis(request)
     except Exception as error:
@@ -546,7 +539,6 @@ def analyze_change(request: ChangeDetectionRequest):
 @router.post("/analyze/change/pdf")
 def analyze_change_pdf(request: ChangeDetectionRequest):
     """Generate and download a PDF report in the selected language."""
-
     try:
         from reportlab.lib import colors
         from reportlab.lib.enums import TA_CENTER
@@ -568,7 +560,6 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         labels = report_labels(request)
         hindi = is_hindi(request)
         buffer = BytesIO()
-
         font_name = "Helvetica"
 
         if hindi:
@@ -577,22 +568,15 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
                 / "assets"
                 / "NotoSansDevanagari-Regular.ttf"
             )
-
             if not font_path.is_file():
                 raise RuntimeError(
                     "Hindi font not found at "
                     "app/assets/NotoSansDevanagari-Regular.ttf"
                 )
-
             if "PrakritiHindi" not in pdfmetrics.getRegisteredFontNames():
                 pdfmetrics.registerFont(
-                    TTFont(
-                        "PrakritiHindi",
-                        str(font_path),
-                        shapable=True,
-                    )
+                    TTFont("PrakritiHindi", str(font_path), shapable=True)
                 )
-
             font_name = "PrakritiHindi"
 
         document = SimpleDocTemplate(
@@ -605,7 +589,6 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
             title=labels["title"],
             author="PRAKRITI",
         )
-
         styles = getSampleStyleSheet()
 
         if hindi:
@@ -624,7 +607,6 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
             textColor=colors.HexColor("#64748b"),
             spaceAfter=16,
         )
-
         warning_style = ParagraphStyle(
             "CoverageWarning",
             parent=styles["Normal"],
@@ -632,7 +614,6 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
             textColor=colors.HexColor("#92400e"),
             leading=14,
         )
-
         interpretation_style = ParagraphStyle(
             "Interpretation",
             parent=styles["Italic"],
@@ -640,12 +621,10 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
             leading=14,
             spaceBefore=3,
         )
-
         story = [
             Paragraph(escape(labels["title"]), styles["Title"]),
             Paragraph(escape(labels["subtitle"]), subtitle_style),
         ]
-
         header_cell_style = ParagraphStyle(
             "TableHeaderCell",
             parent=styles["Normal"],
@@ -655,27 +634,21 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
 
         def safe_cell(value, style=None):
             """Escape text before putting it into a ReportLab Paragraph."""
-            return Paragraph(
-                escape(str(value)),
-                style or styles["Normal"],
-            )
+            return Paragraph(escape(str(value)), style or styles["Normal"])
 
         def add_table(data, widths):
-            # Paragraph cells allow long Hindi labels to wrap correctly.
+            """Create a consistently styled report table."""
             paragraph_data = [
                 [
-                    safe_cell(cell, header_cell_style if row_index == 0 else None)
+                    safe_cell(
+                        cell,
+                        header_cell_style if row_index == 0 else None,
+                    )
                     for cell in row
                 ]
                 for row_index, row in enumerate(data)
             ]
-
-            table = Table(
-                paragraph_data,
-                colWidths=widths,
-                repeatRows=1,
-            )
-
+            table = Table(paragraph_data, colWidths=widths, repeatRows=1)
             table.setStyle(
                 TableStyle([
                     (
@@ -696,43 +669,34 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
                         "ROWBACKGROUNDS",
                         (0, 1),
                         (-1, -1),
-                        [
-                            colors.white,
-                            colors.HexColor("#f8fafc"),
-                        ],
+                        [colors.white, colors.HexColor("#f8fafc")],
                     ),
                     ("FONTNAME", (0, 0), (-1, -1), font_name),
                     ("PADDING", (0, 0), (-1, -1), 6),
                     ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ])
             )
-
             return table
 
-        # Area of interest.
-        story.append(
-            Paragraph(escape(labels["aoi"]), styles["Heading2"])
-        )
-
+        story.append(Paragraph(escape(labels["aoi"]), styles["Heading2"]))
         aoi_data = [
             [labels["coordinate"], labels["value"]],
+            [
+                labels["location_name"],
+                (request.location_name or "").strip()
+                or labels["not_available"],
+            ],
             [labels["west"], f"{request.west:.6f}"],
             [labels["south"], f"{request.south:.6f}"],
             [labels["east"], f"{request.east:.6f}"],
             [labels["north"], f"{request.north:.6f}"],
         ]
-
         story.append(add_table(aoi_data, [2.2 * inch, 3.5 * inch]))
         story.append(Spacer(1, 16))
 
-        # Comparison periods.
         before = result["before"]
         after = result["after"]
-
-        story.append(
-            Paragraph(escape(labels["periods"]), styles["Heading2"])
-        )
-
+        story.append(Paragraph(escape(labels["periods"]), styles["Heading2"]))
         period_data = [
             [labels["metric"], labels["before"], labels["after"]],
             [
@@ -753,11 +717,7 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
                     else labels["not_available"]
                 ),
             ],
-            [
-                labels["scenes"],
-                str(before["scenes"]),
-                str(after["scenes"]),
-            ],
+            [labels["scenes"], str(before["scenes"]), str(after["scenes"])],
             [
                 labels["valid_pixels"],
                 f"{before['valid_pixel_count']:,}",
@@ -774,7 +734,6 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
                 f"{after['coverage_percent']:.2f}%",
             ],
         ]
-
         story.append(
             add_table(
                 period_data,
@@ -783,52 +742,49 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         )
         story.append(Spacer(1, 14))
 
-        # Water extent section.
         water_result = result.get("water", {}) or {}
         water_before_data = water_result.get("before")
         water_after_data = water_result.get("after")
 
-        def _fmt_water_val(data, key):
+        def fmt_water_value(data, key):
             """Format a water value, showing N/A if data is missing."""
             if data is None:
                 return labels["water_not_available"]
-            val = data.get(key)
-            if val is None:
+            value = data.get(key)
+            if value is None:
                 return labels["water_not_available"]
-            return f"{float(val):.4f}"
+            return f"{float(value):.4f}"
 
-        def _fmt_water_pct(data):
+        def fmt_water_percent(data):
             """Format water percentage, showing N/A if data is missing."""
             if data is None:
                 return labels["water_not_available"]
-            val = data.get("water_percent_valid")
-            if val is None:
+            value = data.get("water_percent_valid")
+            if value is None:
                 return labels["water_not_available"]
-            return f"{float(val):.2f}%"
+            return f"{float(value):.2f}%"
 
         story.append(
             Paragraph(escape(labels["water_extent"]), styles["Heading2"])
         )
-
         water_data = [
             [labels["metric"], labels["before"], labels["after"]],
             [
                 labels["water_area"],
-                _fmt_water_val(water_before_data, "water_area_km2"),
-                _fmt_water_val(water_after_data, "water_area_km2"),
+                fmt_water_value(water_before_data, "water_area_km2"),
+                fmt_water_value(water_after_data, "water_area_km2"),
             ],
             [
                 labels["valid_area"],
-                _fmt_water_val(water_before_data, "valid_area_km2"),
-                _fmt_water_val(water_after_data, "valid_area_km2"),
+                fmt_water_value(water_before_data, "valid_area_km2"),
+                fmt_water_value(water_after_data, "valid_area_km2"),
             ],
             [
                 labels["water_percent"],
-                _fmt_water_pct(water_before_data),
-                _fmt_water_pct(water_after_data),
+                fmt_water_percent(water_before_data),
+                fmt_water_percent(water_after_data),
             ],
         ]
-
         story.append(
             add_table(
                 water_data,
@@ -837,26 +793,15 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         )
         story.append(Spacer(1, 14))
 
-        # Coverage warnings.
         if result["coverage_warnings"]:
             warning_items = [
-                Paragraph(
-                    escape(labels["warnings"]),
-                    styles["Heading2"],
-                )
+                Paragraph(escape(labels["warnings"]), styles["Heading2"])
             ]
-
             for warning in result["coverage_warnings"]:
-                warning_items.append(
-                    Paragraph(escape(warning), warning_style)
-                )
+                warning_items.append(Paragraph(escape(warning), warning_style))
                 warning_items.append(Spacer(1, 4))
 
-            warning_table = Table(
-                [[warning_items]],
-                colWidths=[5.7 * inch],
-            )
-
+            warning_table = Table([[warning_items]], colWidths=[5.7 * inch])
             warning_table.setStyle(
                 TableStyle([
                     (
@@ -879,52 +824,35 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
                 ])
             )
-
-            story.append(
-                KeepTogether([
-                    warning_table,
-                    Spacer(1, 10),
-                ])
-            )
+            story.append(KeepTogether([warning_table, Spacer(1, 10)]))
 
         coverage_explanation = (
-    f"{labels['coverage_explanation']}: "
-    f"{COVERAGE_WARNING_THRESHOLD:.0f}%"
-    if hindi
-    else (
-        f"{labels['coverage_explanation']}: "
-        f"{COVERAGE_WARNING_THRESHOLD:.0f}%."
-    )
-)
-
-        story.append(
-            Paragraph(
-                escape(coverage_explanation),
-                styles["Italic"],
+            f"{labels['coverage_explanation']}: "
+            f"{COVERAGE_WARNING_THRESHOLD:.0f}%"
+            if hindi
+            else (
+                f"{labels['coverage_explanation']}: "
+                f"{COVERAGE_WARNING_THRESHOLD:.0f}%."
             )
         )
-        story.append(Spacer(1, 14))
-
-        # Analysis results.
         story.append(
-            Paragraph(escape(labels["results"]), styles["Heading2"])
+            Paragraph(escape(coverage_explanation), styles["Italic"])
         )
+        story.append(Spacer(1, 14))
+        story.append(Paragraph(escape(labels["results"]), styles["Heading2"]))
 
         change = result["change_percent"]
-
         change_text = (
             f"{change:+.1f}%"
             if isinstance(change, (int, float))
             else labels["not_available"]
         )
-
         story.append(
             Paragraph(
                 escape(f"{labels['change']}: {change_text}"),
                 styles["Normal"],
             )
         )
-
         story.append(
             Paragraph(
                 escape(
@@ -936,7 +864,6 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
         )
         story.append(Spacer(1, 8))
 
-        # Interpretation.
         after_coverage = after["coverage_percent"]
         coverage_threshold = result["coverage_warning_threshold"]
 
@@ -996,12 +923,8 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
             )
 
         story.append(
-            Paragraph(
-                escape(interpretation),
-                interpretation_style,
-            )
+            Paragraph(escape(interpretation), interpretation_style)
         )
-
         document.build(story)
         buffer.seek(0)
 
@@ -1014,6 +937,5 @@ def analyze_change_pdf(request: ChangeDetectionRequest):
                 )
             },
         )
-
     except Exception as error:
         handle_analysis_error(error)

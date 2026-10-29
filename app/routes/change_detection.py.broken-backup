@@ -1,0 +1,659 @@
+
+from datetime import date
+from io import BytesIO
+from pathlib import Path
+from typing import Any, Optional
+
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+
+from app.services.ndvi_pipeline import (
+    COVERAGE_WARNING_THRESHOLD,
+    compute_change,
+    get_mndwi_water_extent,
+    get_ndvi_for_period,
+    init_earth_engine,
+    resolve_aoi,
+)
+
+router = APIRouter()
+
+
+class ChangeDetectionRequest(BaseModel):
+    west: float
+    south: float
+    east: float
+    north: float
+
+    before_start: date
+    before_end: date
+    after_start: date
+    after_end: date
+
+    language: str = "en"
+    max_cloud_pct: float = Field(default=80, gt=0, le=100)
+
+
+def _validate_request(request: ChangeDetectionRequest) -> None:
+    """Validate coordinates and date ranges before starting satellite analysis."""
+    if not (
+        -180 <= request.west < request.east <= 180
+        and -90 <= request.south < request.north <= 90
+    ):
+        raise HTTPException(
+            status_code=422,
+            detail="Invalid area coordinates. Check west, south, east and north.",
+        )
+
+    if request.before_start > request.before_end:
+        raise HTTPException(
+            status_code=422,
+            detail="The before-period start date must be on or before its end date.",
+        )
+
+    if request.after_start > request.after_end:
+        raise HTTPException(
+            status_code=422,
+            detail="The after-period start date must be on or before its end date.",
+        )
+
+    if request.before_end >= request.after_start:
+        raise HTTPException(
+            status_code=422,
+            detail="The before and after periods must not overlap.",
+        )
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    """Return a finite float, or None for missing/invalid values."""
+    if value is None or isinstance(value, bool):
+        return None
+
+    try:
+        result = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+    if result != result or result in (float("inf"), float("-inf")):
+        return None
+
+    return result
+
+def is_hindi(language: str) -> bool:
+    """Return True when the requested language is Hindi."""
+    return str(language).lower().startswith("hi")
+
+
+def _language(request: ChangeDetectionRequest) -> str:
+    """Use Hindi when explicitly requested; otherwise default to English."""
+    return "hi" if str(request.language).lower().startswith("hi") else "en"
+
+
+def _period_payload(
+    period: dict,
+    water: Optional[dict] = None,
+) -> dict:
+    """Build a JSON-safe period result without exposing Earth Engine objects."""
+    scene_count = period.get("scene_count", period.get("scenes", 0))
+    valid_pixel_count = period.get("valid_pixel_count", 0)
+    total_pixel_count = period.get("total_pixel_count", 0)
+
+    result = {
+        "mean_ndvi": _safe_float(period.get("mean_ndvi")),
+        "scene_count": scene_count,
+        "scenes": scene_count,
+        "valid_pixel_count": valid_pixel_count,
+        "total_pixel_count": total_pixel_count,
+        "coverage_percent": _safe_float(period.get("coverage_percent")),
+        "coverage_warning": bool(period.get("coverage_warning", False)),
+    }
+
+    if water is not None:
+        result["water_area_km2"] = _safe_float(
+            water.get("water_area_km2")
+        )
+        result["water_valid_area_km2"] = _safe_float(
+            water.get(
+                "water_valid_area_km2",
+                water.get("valid_area_km2"),
+            )
+        )
+        result["water_percent_valid"] = _safe_float(
+            water.get("water_percent_valid")
+        )
+
+    return result
+
+def translate_classification(classification: str, language: str) -> str:
+    """Translate vegetation-change classifications into Hindi when requested."""
+    value = str(classification).strip()
+    normalized = value.lower().replace("_", " ").replace("-", " ")
+
+    if not str(language).lower().startswith("hi"):
+        return value
+
+    translations = {
+        "vegetation gain": "वनस्पति में वृद्धि",
+        "increase": "वनस्पति में वृद्धि",
+        "increased": "वनस्पति में वृद्धि",
+        "gain": "वनस्पति में वृद्धि",
+        "vegetation loss": "वनस्पति में कमी",
+        "decrease": "वनस्पति में कमी",
+        "decreased": "वनस्पति में कमी",
+        "loss": "वनस्पति में कमी",
+        "stable": "वनस्पति में कोई स्पष्ट बदलाव नहीं",
+        "no clear vegetation change": "वनस्पति में कोई स्पष्ट बदलाव नहीं",
+        "no significant change": "वनस्पति में कोई स्पष्ट बदलाव नहीं",
+    }
+
+    return translations.get(normalized, value)
+
+def translate_coverage_warning(warning: str, language: str) -> str:
+    """Translate satellite-data coverage warnings into Hindi when requested."""
+    value = str(warning).strip()
+
+    if not str(language).lower().startswith("hi"):
+        return value
+
+    translations = {
+        "Low valid-pixel coverage for the before period.":
+            "पहली अवधि में वैध पिक्सेल कवरेज कम है।",
+        "Low valid-pixel coverage for the after period.":
+            "दूसरी अवधि में वैध पिक्सेल कवरेज कम है।",
+        "Valid satellite-data coverage is low for the before period.":
+            "पहली अवधि में वैध उपग्रह डेटा का कवरेज कम है।",
+        "Valid satellite-data coverage is low for the after period.":
+            "दूसरी अवधि में वैध उपग्रह डेटा का कवरेज कम है।",
+        "Low coverage":
+            "डेटा कवरेज कम है।",
+        "Low valid-pixel coverage":
+            "वैध पिक्सेल कवरेज कम है।",
+    }
+
+    return translations.get(value, value)
+        
+def _classification(change_result: dict, language: str) -> str:
+    """Translate the vegetation-change classification for the API response."""
+    direction = str(change_result.get("direction", "stable")).lower()
+
+    if direction in {"increase", "increased", "gain", "vegetation gain"}:
+        return "वनस्पति में वृद्धि" if language == "hi" else "Vegetation gain"
+
+    if direction in {"decrease", "decreased", "loss", "vegetation loss"}:
+        return "वनस्पति में कमी" if language == "hi" else "Vegetation loss"
+
+    return "वनस्पति में कोई स्पष्ट बदलाव नहीं" if language == "hi" else "No clear vegetation change"
+
+
+def _analysis_note(language: str, low_coverage: bool) -> str:
+    """Return the scientific caveat appropriate for the selected language."""
+    if language == "hi":
+        note = (
+            "NDVI वनस्पति की हरियाली का संकेत देता है; यह सीधे पेड़ों की "
+            "संख्या या जंगल के स्वास्थ्य को प्रमाणित नहीं करता। NDVI में "
+            "कमी अपने-आप में वनों की कटाई का प्रमाण नहीं है। बादल, छाया, "
+            "मौसम और उपलब्ध उपग्रह चित्र परिणामों को प्रभावित कर सकते हैं। "
+            "महत्वपूर्ण निष्कर्षों की स्थल पर जाँच करें।"
+        )
+        if low_coverage:
+            note += (
+                " उपलब्ध वैध उपग्रह डेटा का कवरेज कम है, इसलिए परिणाम "
+                "को सावधानी से समझें।"
+            )
+        return note
+
+    note = (
+        "NDVI indicates vegetation greenness; it does not directly measure "
+        "tree count or prove forest health. An NDVI decrease alone does not "
+        "prove deforestation. Clouds, shadows, seasonality and satellite-image "
+        "availability can affect the result. Verify important findings on the ground."
+    )
+    if low_coverage:
+        note += (
+            " Valid satellite-data coverage is low for at least one period, "
+            "so interpret the result cautiously."
+        )
+    return note
+
+
+def _water_note(language: str) -> str:
+    if language == "hi":
+        return (
+            "जल क्षेत्र का अनुमान MNDWI > 0 के प्रारंभिक संकेतक पर आधारित है। "
+            "यह पूर्ण जल-वर्गीकरण नहीं है। मौसम, बादल और चित्रों की उपलब्धता "
+            "प्रभाव डाल सकते हैं; बदलाव अपने-आप में सूखा, बाढ़ या अतिक्रमण "
+            "सिद्ध नहीं करता। स्थल पर जाँच करें।"
+        )
+
+    return (
+        "Water extent is estimated using MNDWI > 0 as an initial screening "
+        "heuristic, not an authoritative water classification. Seasonality, "
+        "clouds and image availability can affect the estimate. A change alone "
+        "does not prove drought, flooding or encroachment; verify on the ground."
+    )
+
+
+def _get_water_metrics(period: dict, aoi: Any) -> Optional[dict]:
+    """Calculate water metrics only when a usable composite image is present."""
+    composite = period.get("composite_image")
+    if composite is None:
+        return None
+
+    try:
+        water = get_mndwi_water_extent(composite, aoi)
+        return water if isinstance(water, dict) else None
+    except Exception:
+        # Water estimation is supplementary. Do not discard a valid NDVI result.
+        return None
+
+
+def run_analysis(request: ChangeDetectionRequest) -> dict:
+    """Run two-period NDVI change analysis and optional MNDWI water estimates."""
+    _validate_request(request)
+    language = _language(request)
+
+    try:
+        init_earth_engine()
+        aoi = resolve_aoi(
+            request.west,
+            request.south,
+            request.east,
+            request.north,
+        )
+
+        before_result = get_ndvi_for_period(
+            aoi=aoi,
+            start_date=request.before_start.isoformat(),
+            end_date=request.before_end.isoformat(),
+            max_cloud_pct=request.max_cloud_pct,
+        )
+
+        after_result = get_ndvi_for_period(
+            aoi=aoi,
+            start_date=request.after_start.isoformat(),
+            end_date=request.after_end.isoformat(),
+            max_cloud_pct=request.max_cloud_pct,
+        )
+
+        if not isinstance(before_result, dict) or not isinstance(after_result, dict):
+            raise HTTPException(
+                status_code=502,
+                detail="Satellite analysis returned an unexpected result.",
+            )
+
+        before_ndvi = _safe_float(before_result.get("mean_ndvi"))
+        after_ndvi = _safe_float(after_result.get("mean_ndvi"))
+
+        if before_ndvi is None or after_ndvi is None:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "NDVI could not be calculated for one or both periods. "
+                    "Try different dates or a less cloudy period."
+                ),
+            )
+
+        # Keep the change calculation in run_analysis scope.
+        change_result = compute_change(before_ndvi, after_ndvi)
+
+        before_water = _get_water_metrics(before_result, aoi)
+        after_water = _get_water_metrics(after_result, aoi)
+
+        before = _period_payload(before_result, before_water)
+        after = _period_payload(after_result, after_water)
+
+        before_coverage = _safe_float(before.get("coverage_percent"))
+        after_coverage = _safe_float(after.get("coverage_percent"))
+        threshold = _safe_float(COVERAGE_WARNING_THRESHOLD)
+
+        low_coverage = (
+            threshold is not None
+            and (
+                (before_coverage is not None and before_coverage < threshold)
+                or (after_coverage is not None and after_coverage < threshold)
+            )
+        )
+
+        coverage_warnings = []
+
+        if before.get("coverage_warning") or (
+            before_coverage is not None
+            and threshold is not None
+            and before_coverage < threshold
+        ):
+            coverage_warnings.append(
+                "पहली अवधि में वैध उपग्रह डेटा का कवरेज कम है।"
+                if language == "hi"
+                else "Valid satellite-data coverage is low for the before period."
+            )
+
+        if after.get("coverage_warning") or (
+            after_coverage is not None
+            and threshold is not None
+            and after_coverage < threshold
+        ):
+            coverage_warnings.append(
+                "दूसरी अवधि में वैध उपग्रह डेटा का कवरेज कम है।"
+                if language == "hi"
+                else "Valid satellite-data coverage is low for the after period."
+            )
+
+        result = {
+            "before": before,
+            "after": after,
+            "change_percent": _safe_float(
+                change_result.get(
+                    "pct_change",
+                    change_result.get("change_percent"),
+                )
+            ),
+            "classification": _classification(change_result, language),
+            "note": _analysis_note(language, low_coverage),
+            "max_cloud_pct": request.max_cloud_pct,
+            "coverage_warning_threshold": COVERAGE_WARNING_THRESHOLD,
+            "coverage_warnings": coverage_warnings,
+        }
+
+        if before_water is not None or after_water is not None:
+            result["water_note"] = _water_note(language)
+
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Keep implementation details and credentials out of public responses.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Analysis failed: {type(exc).__name__}. Check the backend logs.",
+        ) from exc
+
+
+@router.post("/analyze/change")
+def analyze_change(request: ChangeDetectionRequest) -> dict:
+    """Return the two-period satellite change analysis."""
+    return run_analysis(request)
+
+def report_labels(language: str) -> dict:
+    """Return translated report labels for existing callers and tests."""
+    return _report_labels(language)
+
+def _report_labels(language: str) -> dict:
+    if language == "hi":
+        return {
+            "title": "DRISHTI पर्यावरण परिवर्तन रिपोर्ट",
+            "area": "चयनित क्षेत्र",
+            "before": "पहली अवधि",
+            "after": "दूसरी अवधि",
+            "mean_ndvi": "औसत NDVI",
+            "scenes": "उपयोग किए गए उपग्रह दृश्य",
+            "coverage": "वैध डेटा कवरेज (%)",
+            "change": "NDVI में परिवर्तन (%)",
+            "classification": "परिणाम",
+            "warnings": "डेटा कवरेज चेतावनियाँ",
+            "note": "महत्वपूर्ण सावधानी",
+            "water": "अनुमानित जल क्षेत्र (वर्ग किमी)",
+            "water_valid": "वैध जल विश्लेषण क्षेत्र (वर्ग किमी)",
+            "water_percent": "वैध क्षेत्र में जल का अनुमान (%)",
+            "water_note": "जल विश्लेषण की सावधानी",
+            "not_available": "उपलब्ध नहीं",
+        }
+
+    return {
+        "title": "DRISHTI Environmental Change Report",
+        "area": "Selected area",
+        "before": "Before period",
+        "after": "After period",
+        "mean_ndvi": "Mean NDVI",
+        "scenes": "Satellite scenes used",
+        "coverage": "Valid data coverage (%)",
+        "change": "NDVI change (%)",
+        "classification": "Result",
+        "warnings": "Coverage warnings",
+        "note": "Important caveat",
+        "water": "Estimated water area (sq km)",
+        "water_valid": "Valid water-analysis area (sq km)",
+        "water_percent": "Estimated water within valid area (%)",
+        "water_note": "Water-analysis caveat",
+        "not_available": "Not available",
+    }
+
+
+def _display_value(value: Any, missing: str) -> str:
+    if value is None:
+        return missing
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
+
+
+def _create_pdf_report(request: ChangeDetectionRequest, analysis: dict) -> bytes:
+    """Create a bilingual ReportLab PDF from the analysis response."""
+    try:
+        from reportlab.lib import colors
+        from reportlab.lib.enums import TA_LEFT
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.units import mm
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.platypus import (
+            SimpleDocTemplate,
+            Paragraph,
+            Spacer,
+            Table,
+            TableStyle,
+        )
+    except ImportError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail="PDF generation dependency is not installed.",
+        ) from exc
+
+    language = _language(request)
+    labels = _report_labels(language)
+    missing = labels["not_available"]
+
+    output = BytesIO()
+    document = SimpleDocTemplate(
+        output,
+        pagesize=A4,
+        rightMargin=18 * mm,
+        leftMargin=18 * mm,
+        topMargin=18 * mm,
+        bottomMargin=18 * mm,
+        title=labels["title"],
+        author="DRISHTI",
+    )
+
+    styles = getSampleStyleSheet()
+    normal = styles["BodyText"]
+    normal.fontSize = 9
+    normal.leading = 13
+
+    title_style = ParagraphStyle(
+        "DrishtiTitle",
+        parent=styles["Title"],
+        fontSize=17,
+        leading=22,
+        alignment=TA_LEFT,
+        spaceAfter=12,
+    )
+
+    # Register the bundled Devanagari font when producing a Hindi report.
+    if language == "hi":
+        font_path = (
+            Path(__file__).resolve().parents[1]
+            / "assets"
+            / "NotoSansDevanagari-Regular.ttf"
+        )
+        if font_path.exists():
+            try:
+                if "DrishtiHindi" not in pdfmetrics.getRegisteredFontNames():
+                    pdfmetrics.registerFont(
+                        TTFont("DrishtiHindi", str(font_path))
+                    )
+                normal.fontName = "DrishtiHindi"
+                title_style.fontName = "DrishtiHindi"
+            except Exception:
+                # Keep PDF generation available if font registration fails.
+                pass
+
+    story = [
+        Paragraph(labels["title"], title_style),
+        Paragraph(
+            f"{labels['area']}: "
+            f"W {request.west:.5f}, S {request.south:.5f}, "
+            f"E {request.east:.5f}, N {request.north:.5f}",
+            normal,
+        ),
+        Spacer(1, 8),
+    ]
+
+    table_data = [
+        [
+            "Metric",
+            labels["before"],
+            labels["after"],
+        ],
+        [
+            labels["mean_ndvi"],
+            _display_value(analysis["before"].get("mean_ndvi"), missing),
+            _display_value(analysis["after"].get("mean_ndvi"), missing),
+        ],
+        [
+            labels["scenes"],
+            _display_value(analysis["before"].get("scenes"), missing),
+            _display_value(analysis["after"].get("scenes"), missing),
+        ],
+        [
+            labels["coverage"],
+            _display_value(analysis["before"].get("coverage_percent"), missing),
+            _display_value(analysis["after"].get("coverage_percent"), missing),
+        ],
+    ]
+
+    if (
+        "water_area_km2" in analysis["before"]
+        or "water_area_km2" in analysis["after"]
+    ):
+        table_data.extend(
+            [
+                [
+                    labels["water"],
+                    _display_value(
+                        analysis["before"].get("water_area_km2"), missing
+                    ),
+                    _display_value(
+                        analysis["after"].get("water_area_km2"), missing
+                    ),
+                ],
+                [
+                    labels["water_valid"],
+                    _display_value(
+                        analysis["before"].get("water_valid_area_km2"), missing
+                    ),
+                    _display_value(
+                        analysis["after"].get("water_valid_area_km2"), missing
+                    ),
+                ],
+                [
+                    labels["water_percent"],
+                    _display_value(
+                        analysis["before"].get("water_percent_valid"), missing
+                    ),
+                    _display_value(
+                        analysis["after"].get("water_percent_valid"), missing
+                    ),
+                ],
+            ]
+        )
+
+    table = Table(table_data, colWidths=[68 * mm, 48 * mm, 48 * mm], repeatRows=1)
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#173D35")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#CBD5D1")),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+                ("FONTNAME", (0, 0), (-1, -1), normal.fontName),
+            ]
+        )
+    )
+
+    story.extend(
+        [
+            table,
+            Spacer(1, 12),
+            Paragraph(
+                f"<b>{labels['change']}:</b> "
+                f"{_display_value(analysis.get('change_percent'), missing)}",
+                normal,
+            ),
+            Paragraph(
+                f"<b>{labels['classification']}:</b> "
+                f"{analysis.get('classification', missing)}",
+                normal,
+            ),
+            Spacer(1, 8),
+            Paragraph(f"<b>{labels['note']}:</b>", normal),
+            Paragraph(analysis.get("note", ""), normal),
+        ]
+    )
+
+    warnings = analysis.get("coverage_warnings") or []
+    if warnings:
+        story.extend(
+            [
+                Spacer(1, 8),
+                Paragraph(f"<b>{labels['warnings']}:</b>", normal),
+            ]
+        )
+        for warning in warnings:
+            story.append(Paragraph(f"• {warning}", normal))
+
+    if analysis.get("water_note"):
+        story.extend(
+            [
+                Spacer(1, 8),
+                Paragraph(f"<b>{labels['water_note']}:</b>", normal),
+                Paragraph(analysis["water_note"], normal),
+            ]
+        )
+
+    story.extend(
+        [
+            Spacer(1, 12),
+            Paragraph(
+                "DRISHTI — satellite-based environmental screening. "
+                "Results depend on image availability and analysis assumptions; "
+                "field verification is recommended.",
+                normal,
+            ),
+        ]
+    )
+
+    document.build(story)
+    return output.getvalue()
+
+
+@router.post("/analyze/change/pdf")
+def analyze_change_pdf(request: ChangeDetectionRequest):
+    """Return the analysis as a downloadable PDF report."""
+    analysis = run_analysis(request)
+    pdf_bytes = _create_pdf_report(request, analysis)
+
+    filename = "drishti_environmental_change_report.pdf"
+    return StreamingResponse(
+        BytesIO(pdf_bytes),
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"'
+        },
+    )

@@ -1,7 +1,7 @@
 
 """
-NDVI Pipeline for DRISHTI
-=========================
+NDVI Pipeline for DRISHTI / Prakriti
+====================================
 
 Deterministic Sentinel-2 vegetation analysis using Google Earth Engine.
 
@@ -13,9 +13,13 @@ Features:
 - Mean NDVI and valid-pixel coverage statistics
 - Low-coverage warnings and empty-data validation
 - Percentage change and vegetation-change classification
+- Historical NDVI time series with yearly or monthly intervals
 """
 
 import math
+from datetime import date, timedelta
+from pathlib import Path
+
 import ee
 
 
@@ -28,15 +32,29 @@ COVERAGE_WARNING_THRESHOLD = 70.0
 # Initialization
 # ---------------------------------------------------------------------------
 
+
 def init_earth_engine(service_account_email: str, key_path: str):
-    """
-    Authenticate and initialize Google Earth Engine using a service account.
-    """
+    """Authenticate and initialize Google Earth Engine."""
+
+    key_file = Path(key_path).expanduser()
+
+    if not key_file.is_file():
+        raise FileNotFoundError(
+            f"Earth Engine key file not found: {key_file}"
+        )
+
     credentials = ee.ServiceAccountCredentials(
         service_account_email,
-        key_path,
+        str(key_file),
     )
-    ee.Initialize(credentials)
+
+    ee.Initialize(
+        credentials,
+        project="satquery-ai-507509",
+    )
+
+    print("Google Earth Engine initialized successfully.")
+
 
 
 # ---------------------------------------------------------------------------
@@ -49,9 +67,8 @@ def resolve_aoi(
     east: float,
     north: float,
 ) -> ee.Geometry:
-    """
-    Convert a longitude/latitude bounding box into an Earth Engine rectangle.
-    """
+    """Convert a longitude/latitude bounding box into an Earth Engine rectangle."""
+
     if not all(
         math.isfinite(value)
         for value in (west, south, east, north)
@@ -90,9 +107,8 @@ def mask_sentinel2_clouds(image: ee.Image) -> ee.Image:
         9  = Clouds, high probability
         10 = Cirrus
         11 = Snow or ice
-
-    The mask is applied to every image before compositing.
     """
+
     scl = image.select("SCL")
 
     valid_pixels = (
@@ -121,9 +137,10 @@ def get_cloud_filtered_collection(
     First filters scenes by their overall cloud percentage, then applies
     the per-pixel SCL mask.
 
-    Note: scene-level cloud percentage does not represent the cloud
-    percentage inside the selected AOI.
+    Scene-level cloud percentage does not represent cloud percentage
+    inside the selected AOI.
     """
+
     if not 0 <= max_cloud_pct <= 100:
         raise ValueError("max_cloud_pct must be between 0 and 100.")
 
@@ -151,9 +168,7 @@ def get_cloud_filtered_collection(
 # ---------------------------------------------------------------------------
 
 def build_composite(collection: ee.ImageCollection) -> ee.Image:
-    """
-    Build a per-pixel median composite from the masked image collection.
-    """
+    """Build a per-pixel median composite from the masked image collection."""
     return collection.median()
 
 
@@ -163,17 +178,14 @@ def build_composite(collection: ee.ImageCollection) -> ee.Image:
 
 def compute_ndvi_image(composite: ee.Image) -> ee.Image:
     """
-    Calculate NDVI using Sentinel-2 bands:
+    Calculate NDVI using Sentinel-2 bands.
 
-        NDVI = (B8 - B4) / (B8 + B4)
+    NDVI = (B8 - B4) / (B8 + B4)
 
     B8 = Near-infrared
     B4 = Red
-
-    Earth Engine normalizedDifference() masks pixels where either input
-    band is negative. Such pixels will therefore not count as valid NDVI
-    pixels in the coverage calculation.
     """
+
     return composite.normalizedDifference(
         ["B8", "B4"]
     ).rename("NDVI")
@@ -188,11 +200,8 @@ def get_mean_ndvi(
     aoi: ee.Geometry,
     scale: int = 10,
 ) -> float:
-    """
-    Calculate the mean NDVI over the AOI using valid pixels only.
+    """Calculate mean NDVI over the AOI using valid pixels only."""
 
-    Raises ValueError if the AOI contains no usable NDVI pixels.
-    """
     stats = ndvi_image.reduceRegion(
         reducer=ee.Reducer.mean(),
         geometry=aoi,
@@ -221,7 +230,6 @@ def get_mean_ndvi(
 # Step 6: Calculate valid-pixel coverage
 # ---------------------------------------------------------------------------
 
-
 def get_valid_pixel_coverage(
     ndvi_image: ee.Image,
     aoi: ee.Geometry,
@@ -229,10 +237,11 @@ def get_valid_pixel_coverage(
 ) -> dict:
     """
     Calculate valid-pixel coverage using pixel area.
-    Pixel counts are returned for reporting, while coverage_percent
-    is calculated from valid area divided by total area.
 
+    Pixel counts are returned for reporting. Coverage percentage is
+    calculated from valid area divided by total sampled area.
     """
+
     if scale <= 0:
         raise ValueError("scale must be greater than zero.")
 
@@ -310,9 +319,7 @@ def get_valid_pixel_coverage(
     valid_area = float(valid_area)
 
     if total_count <= 0 or total_area <= 0:
-        raise ValueError(
-            "No sampled pixels were found inside the AOI."
-        )
+        raise ValueError("No sampled pixels were found inside the AOI.")
 
     valid_count = min(max(valid_count, 0), total_count)
     valid_area = min(max(valid_area, 0.0), total_area)
@@ -326,10 +333,8 @@ def get_valid_pixel_coverage(
     }
 
 
-
-
 # ---------------------------------------------------------------------------
-# Steps 2-7: Analyze one date period
+# Step 7: Analyze one date period
 # ---------------------------------------------------------------------------
 
 def get_ndvi_for_period(
@@ -352,6 +357,7 @@ def get_ndvi_for_period(
 
     Raises ValueError if no scenes or no usable NDVI pixels are available.
     """
+
     collection = get_cloud_filtered_collection(
         aoi,
         start_date,
@@ -372,7 +378,6 @@ def get_ndvi_for_period(
     composite = build_composite(collection)
     ndvi_image = compute_ndvi_image(composite)
 
-    # Check coverage before reporting the mean NDVI.
     coverage = get_valid_pixel_coverage(ndvi_image, aoi)
 
     if coverage["valid_pixel_count"] == 0:
@@ -390,7 +395,7 @@ def get_ndvi_for_period(
         coverage_warning = (
             f"Low valid-pixel coverage: "
             f"{coverage['coverage_percent']:.2f}% of sampled AOI pixels "
-            f"were usable. Interpret this period's NDVI cautiously."
+            "were usable. Interpret this period's NDVI cautiously."
         )
 
         print(
@@ -423,16 +428,10 @@ def compute_change(
     Percentage change:
         ((after_ndvi - before_ndvi) / before_ndvi) * 100
 
-    A negative change means NDVI decreased.
-    A positive change means NDVI increased.
-
-    The percentage is rounded to one decimal place before classification,
-    ensuring the displayed percentage and classification use the same value.
-
-    Note:
-        NDVI change alone does not prove flooding, vegetation damage,
-        or whether an area is safe.
+    NDVI change alone does not prove flooding, vegetation damage,
+    or whether an area is safe.
     """
+
     if not math.isfinite(before_ndvi) or not math.isfinite(after_ndvi):
         raise ValueError("NDVI values must be finite numbers.")
 
@@ -468,6 +467,7 @@ def compute_change(
         ),
     }
 
+
 # ---------------------------------------------------------------------------
 # Step 9: Estimate water extent using MNDWI
 # ---------------------------------------------------------------------------
@@ -482,6 +482,7 @@ def get_mndwi_water_extent(
 
     This is an estimate, not definitive flood detection.
     """
+
     green = composite.select("B3")
     swir = composite.select("B11")
 
@@ -519,6 +520,7 @@ def get_mndwi_water_extent(
     )
 
     total_area_m2 = ee.Number(total_area).getInfo()
+
     water_area_m2 = ee.Number(
         ee.Algorithms.If(
             ee.Algorithms.IsEqual(water_area, None),
@@ -542,4 +544,157 @@ def get_mndwi_water_extent(
         "water_area_km2": round(water_area_km2, 4),
         "valid_area_km2": round(valid_area_km2, 4),
         "water_percent_valid": round(water_percent, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Step 10: Calculate an NDVI time series
+# ---------------------------------------------------------------------------
+
+def get_ndvi_time_series(
+    aoi: ee.Geometry,
+    start_date: str,
+    end_date: str,
+    interval: str = "yearly",
+    max_cloud_pct: int = 20,
+) -> dict:
+    """
+    Calculate historical NDVI observations for an AOI.
+
+    Args:
+        aoi: Earth Engine geometry for the selected area of interest.
+        start_date: First included date in YYYY-MM-DD format.
+        end_date: Last included date in YYYY-MM-DD format.
+        interval: "yearly" or "monthly".
+        max_cloud_pct: Maximum scene-level cloud percentage.
+
+    Returns:
+        {
+            "interval": "yearly",
+            "start_date": "...",
+            "end_date": "...",
+            "observations": [
+                {
+                    "period_start": "...",
+                    "period_end": "...",
+                    "mean_ndvi": 0.4,
+                    "scene_count": 12,
+                    "valid_pixel_count": 1000,
+                    "total_pixel_count": 1200,
+                    "coverage_percent": 83.33,
+                    "coverage_warning": None
+                }
+            ]
+        }
+
+    Periods without usable imagery remain in the series with null NDVI
+    rather than being assigned fabricated zero values.
+
+    Note:
+        This function makes Earth Engine requests for every interval.
+        Monthly analysis can therefore take longer than yearly analysis.
+    """
+
+    try:
+        start = date.fromisoformat(start_date)
+        end = date.fromisoformat(end_date)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Time-series dates must use YYYY-MM-DD format."
+        ) from exc
+
+    if start > end:
+        raise ValueError(
+            "Start date must not be later than end date."
+        )
+
+    if interval not in {"yearly", "monthly"}:
+        raise ValueError(
+            "Interval must be either 'yearly' or 'monthly'."
+        )
+
+    if not 0 <= max_cloud_pct <= 100:
+        raise ValueError(
+            "max_cloud_pct must be between 0 and 100."
+        )
+
+    # The requested end date is inclusive. Earth Engine's filterDate()
+    # end boundary is exclusive, so add one day.
+    exclusive_end = end + timedelta(days=1)
+
+    # Create calendar-aligned intervals clipped to the requested range.
+    periods = []
+    cursor = start
+
+    while cursor < exclusive_end:
+        if interval == "yearly":
+            next_boundary = date(cursor.year + 1, 1, 1)
+        elif cursor.month == 12:
+            next_boundary = date(cursor.year + 1, 1, 1)
+        else:
+            next_boundary = date(cursor.year, cursor.month + 1, 1)
+
+        period_end_exclusive = min(next_boundary, exclusive_end)
+
+        periods.append((cursor, period_end_exclusive))
+        cursor = period_end_exclusive
+
+    # Protect the backend from accidentally processing a very large
+    # monthly request. The limit is 120 intervals (10 years).
+    if len(periods) > 120:
+        raise ValueError(
+            "The selected range contains more than 120 intervals. "
+            "Choose a shorter range for monthly analysis."
+        )
+
+    observations = []
+
+    for period_start, period_end_exclusive in periods:
+        period_start_str = period_start.isoformat()
+        period_end_str = (
+            period_end_exclusive - timedelta(days=1)
+        ).isoformat()
+
+        observation = {
+            "period_start": period_start_str,
+            "period_end": period_end_str,
+            "mean_ndvi": None,
+            "scene_count": 0,
+            "valid_pixel_count": None,
+            "total_pixel_count": None,
+            "coverage_percent": None,
+            "coverage_warning": None,
+        }
+
+        try:
+            result = get_ndvi_for_period(
+                aoi=aoi,
+                start_date=period_start_str,
+                # Use the exclusive boundary for Earth Engine filtering.
+                end_date=period_end_exclusive.isoformat(),
+                max_cloud_pct=max_cloud_pct,
+            )
+
+        except ValueError as exc:
+            # Keep the period in the series without inventing a value.
+            observation["coverage_warning"] = str(exc)
+            observations.append(observation)
+            continue
+
+        observation.update({
+            "mean_ndvi": result["mean_ndvi"],
+            "scene_count": result["scene_count"],
+            "valid_pixel_count": result["valid_pixel_count"],
+            "total_pixel_count": result["total_pixel_count"],
+            "coverage_percent": result["coverage_percent"],
+            "coverage_warning": result["coverage_warning"],
+        })
+
+        observations.append(observation)
+
+    return {
+        "interval": interval,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+        "observations": observations,
     }
